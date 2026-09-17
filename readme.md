@@ -9,6 +9,24 @@ Annika Bendes<sup>#+</sup>, Sophia Björkander<sup>#+</sup>‚ Maura M. Kere<sup
 This repository contains code for analysis and visualisation to accompany the publication  
 _Molecular profiling of repeated self-sampled blood reveals dynamic immune phenotypes in young adults_.
 
+<br><br>
+
+<code>aab inf cutoff generation.qmd</code>, <code>bamse_ben_norm_IgM.Rmd</code>, <code>ben_mixmod.jl</code>, <code>julia_env.yml</code>  
+Perform mixed model normalisation of serology data, with a Conda environment for Julia.
+
+<code>BAMSE_explore_data norm.R</code>  
+Normalise proteomics data using ProtPQN.
+
+<code>bamse_vs_ukb.R</code>  
+Compare protein-trait associations between this study and other studies mentioned in the article.
+
+<code>aabs_IFN_correlation_heatmap.R</code>  
+Visualise IFN AAb correlations.
+
+<code>comp_groups.R</code>  
+Perform group comparisons with statistical testing.
+
+
 <hr>
 
 <sub><sup>#</sup> contributed equally</sub>  
