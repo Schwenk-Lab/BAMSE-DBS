@@ -25,7 +25,7 @@ function estimate_baseline_mc(y_vals,x_vals; verbose = false)
 end
 
 
-df = CSV.read("norm_dir/mixmod_in.csv", DataFrame);
+df = CSV.read("mixmod_in.csv", DataFrame);
 new_df = deepcopy(df);
 
 x_column = "RBD" #This selects the baseline
@@ -56,7 +56,7 @@ for y_column in names(df)[3:end]
     append!(mi_vec, mi);
     append!(ma_vec, ma);
 end
-CSV.write("norm_dir/WithAdjusted.csv",new_df)
+CSV.write("WithAdjusted.csv",new_df)
 
 line_df = DataFrame(protein = names(df)[3:end],
                     o_m_val = o_m_vec,
@@ -64,4 +64,4 @@ line_df = DataFrame(protein = names(df)[3:end],
                     mi_val = mi_vec,
                     ma_val = ma_vec)
 
-CSV.write("norm_dir/line_df.csv", line_df)
+CSV.write("line_df.csv", line_df)

@@ -16,18 +16,7 @@ Code for the normalisation was written by Ben in the Julia programming language.
 
 ```{r}
 
-# write.csv(data_list$mfi %>%
-#             # Label samples to not use in the model ("Blank")
-#             mutate(Sample = case_when(grepl("^X", unique_sample_name) ~ "Sample",
-#                                       grepl("NL\\.neg", unique_sample_name) ~ "Negctrl",
-#                                       T ~ "Empty")) %>%
-#             # mutate(Sample = case_when(grepl("blank", unique_sample_name, ignore.case = T) ~ "Empty",
-#             #                           T ~ "Sample")) %>%
-#             relocate(Sample),
-#           file = paste0(out_dir, "../temporary_output/mixmod_in.csv"),
-#           row.names = F)
-
-out_dir = "./norm_dir/"
+out_dir = "./"
 
 mm_in <- mfi_layout_all_plates %>%
             #filter()
@@ -53,7 +42,7 @@ conda deactivate
 # Environment containing Julia
 conda activate julia_env
 
-julia norm_dir/ben_mixmod.jl
+julia ben_mixmod.jl
 
 conda deactivate
 ```
@@ -62,7 +51,7 @@ conda deactivate
 ```{r}
 
 # julia_env with julia in julia_env.yml to run julia script from Ben
-system("conda run -n julia_env julia norm_dir/ben_mixmod.jl")
+system("conda run -n julia_env ben_mixmod.jl")
 
 ```
 

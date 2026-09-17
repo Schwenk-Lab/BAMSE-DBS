@@ -24,7 +24,7 @@ norm_plots <- F
 library(tidyverse)
 library(patchwork)
 
-out_dir <- "serology_data_analysis/bare_bead_norm/"
+out_dir <- "./"
 
 # MFI for the normalisation
 mfi_temp <- mfi_layout_all_plates[, c("sample_name", "class", beadstock_info$`Antigen description`)]
@@ -179,10 +179,10 @@ for (ph in c("A1", "A2", "A3")) {
     write.csv(file = paste0(out_dir, "mixmod_in.csv"), row.names = F)
   
   # julia_env with julia in julia_env.yml to run julia script from Ben
-  system("conda run -n julia_env julia serology_data_analysis/bare_bead_norm/ben_mixmod.jl")
+  system("conda run -n julia_env julia ben_mixmod.jl")
   
   # Load normalised data
-  mfi_norm <- read_csv("serology_data_analysis/bare_bead_norm/WithAdjusted.csv") %>%
+  mfi_norm <- read_csv("WithAdjusted.csv") %>%
     select(sample_name, class, contains("corrected_log2")) %>%
     rename_with(., function(x) {
       gsub("_corrected_log2", "", x)
@@ -191,7 +191,7 @@ for (ph in c("A1", "A2", "A3")) {
   if (ba_plots) {
     nonblank_ind <- mfi_norm$class != "Empty"
     
-    lines <- read.csv("serology_data_analysis/bare_bead_norm/line_df.csv")
+    lines <- read.csv("line_df.csv")
     
     pdf(paste0(out_dir, Sys.Date(), "_mixmod_before_after_", ph, ".pdf"), onefile = T, width = 12, height = 5)
     for (i in colnames(mfi_norm)[-c(1, 2)]) {
@@ -290,7 +290,7 @@ write_csv(mfi_out, paste0(out_dir, "mfi_norm_ifn_log2.csv"))
 ### Load normalized data:
 
 ```{r}
-ifn_serology_norm_pp_data <- read.csv("serology_data_analysis/bare_bead_norm/mfi_norm_ifn_log2.csv")
+ifn_serology_norm_pp_data <- read.csv("mfi_norm_ifn_log2.csv")
 ```
 
 ### Robust Z-score transformation of AAb data per sampling phase:
