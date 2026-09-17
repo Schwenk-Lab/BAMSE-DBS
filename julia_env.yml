@@ -1,0 +1,6 @@
+name: julia_env
+
+channels:
+ - conda-forge
+dependencies:
+ - julia=1.7.2

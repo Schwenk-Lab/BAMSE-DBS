@@ -1,0 +1,381 @@
+---
+title: "BAMSE DBS AAbs"
+author: "AB"
+format: html
+editor: visual
+---
+
+### Load packages:
+
+### Normalize data:
+
+Apply normalization per sampling phase to minimize overnormalization in phase 3:
+
+Ben's bare-bead normalisation using a mixture model, for BAMSE
+
+```{r}
+# Generate correlation plots?
+cor_plts <- F
+# Generate before/after plots?
+ba_plots <- T
+# Generate plots of normalised data on a common scale? (only for N and IFNs, skip controls)
+norm_plots <- F
+
+library(tidyverse)
+library(patchwork)
+
+out_dir <- "serology_data_analysis/bare_bead_norm/"
+
+# MFI for the normalisation
+mfi_temp <- mfi_layout_all_plates[, c("sample_name", "class", beadstock_info$`Antigen description`)]
+
+# Some sample names are duplicated, add unique ones and keep keys for original names
+samp_info <- data.frame("sample_name" = mfi_temp$sample_name,
+                        "unique_sample_name" = make.names(mfi_temp$sample_name, unique = T))
+mfi_temp$sample_name <- samp_info$unique_sample_name
+
+# Remove all control samples
+mfi_temp <- mfi_temp %>% filter(str_detect(sample_name, "^A\\d_"))
+
+# Make new names for the binders
+beadstock_info$ag_name <- make.names(beadstock_info$`Antigen description`, unique = T) %>%
+  # Remove double dots and dots at the end, turn all letters into lowercase
+  str_replace_all("\\.\\.", "\\.") %>%
+  str_remove_all("\\.$") %>%
+  str_replace_all("\\._", "_") %>%
+  tolower()
+
+colnames(mfi_temp)[3:ncol(mfi_temp)] <- make.names(colnames(mfi_temp)[3:ncol(mfi_temp)], unique = T) %>%
+  # Remove double dots and dots at the end, turn all letters into lowercase
+  str_replace_all("\\.\\.", "\\.") %>%
+  str_remove_all("\\.$") %>%
+  str_replace_all("\\._", "_") %>%
+  tolower()
+
+# Measurements should be numeric
+mfi_temp <- mfi_temp %>% mutate(across(!matches(c("sample_name", "class")), as.numeric))
+
+# Remove an outlier sample which is very high for bare-bead
+mfi_temp <- mfi_temp[-which.max(mfi_temp$bare.bead1), ]
+
+# Check that they are the same
+stopifnot(identical(colnames(mfi_temp)[3:ncol(mfi_temp)], beadstock_info$ag_name))
+
+if (cor_plts) {
+  
+  ### Bare-bead correlation
+  # Use the one called 'bare.bead1' (out of like 8 bare beads in total)
+  # Linear axis
+  pdf(paste0(out_dir, Sys.Date(), "_corr_plt_lin.pdf"), width = 14, height = 8, onefile = T)
+  par(mfrow = c(3, 6))
+  dbs_samp <- mfi_temp$class == "Sample"
+  sapply(beadstock_info$ag_name, function(antigen) {
+    
+    plt_dat <- data.frame("y" = mfi_temp[dbs_samp, antigen, drop = T],
+                          "x" = mfi_temp[dbs_samp, "bare.bead1", drop = T])
+    
+    corr <- cor(plt_dat$x, plt_dat$y) %>% signif(3)
+    
+    plot(plt_dat$x, plt_dat$y, xlab = "bare.bead1", ylab = antigen,# log = "xy",
+         main = antigen, sub = paste0("Corr: ", corr))
+    abline(0, 1, col = 2)
+    
+    return(NULL)
+  })
+  dev.off()
+  # Log axis
+  pdf(paste0(out_dir, Sys.Date(), "_corr_plt_log.pdf"), width = 14, height = 8, onefile = T)
+  par(mfrow = c(3, 6))
+  dbs_samp <- mfi_temp$class == "Sample"
+  sapply(beadstock_info$ag_name, function(antigen) {
+    
+    plt_dat <- data.frame("y" = mfi_temp[dbs_samp, antigen, drop = T],
+                          "x" = mfi_temp[dbs_samp, "bare.bead1", drop = T])
+    
+    corr <- cor(plt_dat$x, plt_dat$y) %>% signif(3)
+    
+    plot(plt_dat$x, plt_dat$y, xlab = "bare.bead1", ylab = antigen, log = "xy",
+         main = antigen, sub = paste0("Corr: ", corr))
+    abline(0, 1, col = 2)
+    
+    return(NULL)
+  })
+  dev.off()
+  
+  # Correlation per plate
+  ag <- "spike.s1"
+  q <- mfi_temp %>%
+    select(sample_name, class, bare.bead1, !!ag) %>%
+    filter(class == "Sample") %>%
+    left_join(mfi_layout_all_plates %>% select(sample_name, Sample_plate), by = "sample_name")
+  
+  pdf(paste0(out_dir, "corr_per_plate.pdf"), width = 14, height = 8, onefile = T)
+  par(mfrow = c(3, 6))
+  sapply(sort(unique(as.numeric(q$Sample_plate))), function(x) {
+    plt_dat <- q %>% filter(Sample_plate == x)
+    cr <- cor(plt_dat$bare.bead1, plt_dat[, ag, drop = T]) %>% signif(3)
+    plot(plt_dat$bare.bead1, plt_dat[, ag, drop = T], log = "y", main = x, sub = cr)
+    return(NULL)
+  })
+  dev.off()
+  
+  ### Correlation with Spike
+  # Use the one called 'spike.s1'
+  # Linear axes
+  pdf(paste0(out_dir, "spk_corr_lin.pdf"), width = 14, height = 8, onefile = T)
+  par(mfrow = c(3, 6))
+  dbs_samp <- mfi_temp$class == "Sample"
+  corr_bin <- "spike.s1"
+  sapply(beadstock_info$ag_name, function(antigen) {
+    
+    plt_dat <- data.frame("y" = mfi_temp[dbs_samp, antigen, drop = T],
+                          "x" = mfi_temp[dbs_samp, corr_bin, drop = T])
+    
+    corr <- cor(plt_dat$x, plt_dat$y) %>% signif(3)
+    
+    plot(plt_dat$x, plt_dat$y, xlab = corr_bin, ylab = antigen,# log = "xy",
+         main = antigen, sub = paste0("Corr: ", corr))
+    abline(0, 1, col = 2)
+    
+    return(NULL)
+  })
+  dev.off()
+  # Log axes
+  pdf(paste0(out_dir, "spk_corr_log.pdf"), width = 14, height = 8, onefile = T)
+  par(mfrow = c(3, 6))
+  dbs_samp <- mfi_temp$class == "Sample"
+  sapply(beadstock_info$ag_name, function(antigen) {
+    
+    plt_dat <- data.frame("y" = mfi_temp[dbs_samp, antigen, drop = T],
+                          "x" = mfi_temp[dbs_samp, corr_bin, drop = T])
+    
+    corr <- cor(plt_dat$x, plt_dat$y) %>% signif(3)
+    
+    plot(plt_dat$x, plt_dat$y, xlab = corr_bin, ylab = antigen, log = "xy",
+         main = antigen, sub = paste0("Corr: ", corr))
+    abline(0, 1, col = 2)
+    
+    return(NULL)
+  })
+  dev.off()
+}
+
+### Normalisation
+# Save temporary data for normalisation
+# Include only IFNs
+
+# Do per phase
+mfi_out <- data.frame()
+
+for (ph in c("A1", "A2", "A3")) {
+  mfi_temp %>%
+    select(sample_name, class, bare.bead1, starts_with(c("ifn", "inf"), ignore.case = T)) %>%
+    # Label samples to not use in the model ("Blank")
+    mutate(class = case_when(class == "Sample" ~ "Sample",
+                             class == "neg_ctrl" ~ "Negctrl",
+                             T ~ "Empty")) %>%
+    # Pick out samples of the current phase
+    filter(str_detect(sample_name, paste0("^", ph, "_"))) %>%
+    write.csv(file = paste0(out_dir, "mixmod_in.csv"), row.names = F)
+  
+  # julia_env with julia in julia_env.yml to run julia script from Ben
+  system("conda run -n julia_env julia serology_data_analysis/bare_bead_norm/ben_mixmod.jl")
+  
+  # Load normalised data
+  mfi_norm <- read_csv("serology_data_analysis/bare_bead_norm/WithAdjusted.csv") %>%
+    select(sample_name, class, contains("corrected_log2")) %>%
+    rename_with(., function(x) {
+      gsub("_corrected_log2", "", x)
+    })
+  
+  if (ba_plots) {
+    nonblank_ind <- mfi_norm$class != "Empty"
+    
+    lines <- read.csv("serology_data_analysis/bare_bead_norm/line_df.csv")
+    
+    pdf(paste0(out_dir, Sys.Date(), "_mixmod_before_after_", ph, ".pdf"), onefile = T, width = 12, height = 5)
+    for (i in colnames(mfi_norm)[-c(1, 2)]) {
+      
+      plt_dat <- data.frame("samp_name" = as.character(mfi_norm$sample_name)) %>%
+        mutate("Raw" = log2(mfi_temp[match(samp_name, mfi_temp$sample_name), i, drop = T]),
+               "Normalised" = mfi_norm[, i, drop = T],
+               "bare.bead1" = log2(mfi_temp[match(samp_name, mfi_temp$sample_name), "bare.bead1", drop = T]),
+               "Sample_type" = mfi_temp[match(samp_name, mfi_temp$sample_name), "class", drop = T])
+      
+      p_before <- ggplot(plt_dat) +
+        geom_point(aes(x = bare.bead1, y = Raw, colour = Sample_type)) +
+        geom_segment(data = lines %>% filter(protein == i),
+                     aes(x = mi_val, xend = ma_val,
+                         y = o_m_val * mi_val + o_c_val, yend = o_m_val * ma_val + o_c_val)) +
+        scale_colour_brewer(palette = "Set2")
+      
+      # Blank deviation for plot subtitle
+      mean_blank_dev <- lines %>% filter(protein == i) %>%
+        summarise(mbd = mean(plt_dat$Raw[!nonblank_ind] - (o_m_val * plt_dat$bare.bead1[!nonblank_ind] + o_c_val))) %>%
+        pull(mbd)
+      
+      p_after <- ggplot(plt_dat) +
+        geom_point(aes(x = bare.bead1, y = Normalised, colour = Sample_type)) +
+        scale_colour_brewer(palette = "Set2")
+      
+      p_both <- p_before + p_after +
+        plot_layout(guides = "collect") +
+        plot_annotation(title = i, subtitle = paste0(
+          "m=", lines[lines$protein == i, "o_m_val"], "; Mean Blank deviation=", mean_blank_dev
+        )) &
+        theme_bw() &
+        theme(axis.line = element_line(size = 1),
+              axis.text = element_text(size = 12),
+              axis.title = element_text(size = 12),
+              plot.title = element_text(size = 15))
+      
+      print(p_both)
+    }
+    dev.off()
+  }
+  
+  if (norm_plots) {
+    pdf(paste0(out_dir, Sys.Date(), "_norm_plots", ph, ".pdf"), onefile = T, width = 6, height = 5)
+    cols_to_plot <- str_subset(colnames(mfi_norm), "nucleocapsid|ifn")
+    for (i in cols_to_plot) {
+      p <- data.frame("class" = mfi_temp[match(mfi_norm$sample_name, mfi_temp$sample_name), "class", drop = T],
+                      "bare.bead1" = mfi_temp[match(mfi_norm$sample_name, mfi_temp$sample_name), "bare.bead1", drop = T],
+                      "norm" = mfi_norm[, i, drop = T]) %>%
+        ggplot(aes(x = bare.bead1, y = norm, colour = class)) +
+        geom_point() +
+        geom_hline(yintercept = 0.5, linetype = "dotted") +
+        geom_hline(yintercept = -0.5, linetype = "dotted") +
+        scale_colour_brewer(palette = "Set2") +
+        ylim(-1.5, 8) +
+        labs(y = "Normalised MFI", title = i) +
+        theme_bw(14)
+      
+      print(p)
+    }
+    dev.off()
+    
+    pdf(paste0(out_dir, Sys.Date(), "_norm_plots_spk", ph, ".pdf"), onefile = T, width = 6, height = 5)
+    cols_to_plot <- str_subset(colnames(mfi_norm), "nucleocapsid|ifn")
+    for (i in cols_to_plot) {
+      p <- data.frame("class" = mfi_temp[match(mfi_norm$sample_name, mfi_temp$sample_name), "class", drop = T],
+                      "spike.s1" = mfi_temp[match(mfi_norm$sample_name, mfi_temp$sample_name), "spike.s1", drop = T],
+                      "norm" = mfi_norm[, i, drop = T]) %>%
+        ggplot(aes(x = spike.s1, y = norm, colour = class)) +
+        geom_point() +
+        geom_hline(yintercept = 0.5, linetype = "dotted") +
+        geom_hline(yintercept = -0.5, linetype = "dotted") +
+        scale_colour_brewer(palette = "Set2") +
+        ylim(-1.5, 8) +
+        labs(y = "Normalised MFI", title = i) +
+        theme_bw(14)
+      
+      print(p)
+    }
+    dev.off()
+  }
+  
+  mfi_out <- rbind(mfi_out, mfi_norm)
+  
+}
+
+mfi_out <- mfi_out %>% select(-class, -bare.bead1)
+
+# Save normalised data
+write_csv(mfi_out, paste0(out_dir, "mfi_norm_ifn_log2.csv"))
+
+```
+
+# Ben's bare-bead normalisation using a mixture model, for BAMSE
+
+### Load normalized data:
+
+```{r}
+ifn_serology_norm_pp_data <- read.csv("serology_data_analysis/bare_bead_norm/mfi_norm_ifn_log2.csv")
+```
+
+### Robust Z-score transformation of AAb data per sampling phase:
+
+```{r}
+
+### Robust Z-score nomralization per phase:
+
+zscores_ifn_nrom_pp_long <- ifn_serology_norm_pp_data |>
+  left_join( serology_norm_rm_empty_sinfo |> dplyr::select( sample_name, idnr, sampling_phase), by = "sample_name") |>
+  pivot_longer( cols = all_of(ifn_beads), values_to = "norm_mfi", names_to = "analyte") |>
+  group_by(sampling_phase, analyte) |>
+  mutate(robust_z = (norm_mfi - median(norm_mfi)) / mad(norm_mfi, constant = 1),
+         z_score = (norm_mfbamse_vs_ukbi - mean(norm_mfi, na.rm = TRUE)) / sd(norm_mfi, na.rm = TRUE)) |>
+  mutate( cl_robust_z = case_when(robust_z > 3.5 ~ "positive",
+                                  T ~ "negative"),
+          cl_robust_z_strict = case_when(robust_z > 7 ~ "positive",
+                                         T ~ "negative"),
+          cl_z_score = case_when(z_score > 3 ~ "positive",
+                                 T ~ "negative"),
+          cl_z_score_strict = case_when(z_score > 6 ~ "positive",
+                                        T ~ "negative")) |>
+  ## remove technical error ones:
+  filter( ! is.na(sampling_phase))
+
+
+## Prepare output tables:
+### Wide format with z-scores
+wide_ifn_data <- zscores_ifn_nrom_pp_long |> dplyr::select(sample_name, idnr, sampling_phase, analyte, robust_z) |>
+  pivot_wider( values_from = robust_z, names_from = analyte)
+
+wb <- createWorkbook()
+
+# Loop over each sampling phase and add as a new sheet
+for (phase in unique(wide_ifn_data$sampling_phase)) {
+  df_phase <- wide_ifn_data %>%
+    filter(sampling_phase == phase) %>%
+    dplyr::select(-sampling_phase)   # remove the column (not needed in sheet)
+  
+  addWorksheet(wb, sheetName = phase)
+  writeData(wb, phase, df_phase)
+}
+
+# Save to Excel
+#saveWorkbook(wb, "aab levels_robust z scores_by_phase_250930.xlsx", overwrite = TRUE)
+
+## Wide format with log2 untransfirmed values
+wide_ifn_data <- zscores_ifn_nrom_pp_long |> dplyr::select(sample_name, idnr, sampling_phase, analyte, norm_mfi) |>
+  pivot_wider( values_from = norm_mfi, names_from = analyte)
+
+wb <- createWorkbook()
+
+# Loop over each sampling phase and add as a new sheet
+for (phase in unique(wide_ifn_data$sampling_phase)) {
+  df_phase <- wide_ifn_data %>%
+    filter(sampling_phase == phase) %>%
+    select(-sampling_phase)   # remove the column (not needed in sheet)
+  
+  addWorksheet(wb, sheetName = phase)
+  writeData(wb, phase, df_phase)
+}
+
+# Save to Excel
+#saveWorkbook(wb, "aab levels_log2 scale_by_phase_250929.xlsx", overwrite = TRUE)
+
+## Binary data for z-scores for thr = 3.5
+wide_ifn_data <- zscores_ifn_nrom_pp_long |> dplyr::select(sample_name, idnr, sampling_phase, analyte, cl_robust_z) |>
+  mutate( cl_robust_z = case_when( cl_robust_z == "positive" ~ 1,
+                                   cl_robust_z == "negative" ~ 0
+  )) |>
+  pivot_wider( values_from = cl_robust_z, names_from = analyte)
+
+wb <- createWorkbook()
+
+# Loop over each sampling phase and add as a new sheet
+for (phase in unique(wide_ifn_data$sampling_phase)) {
+  df_phase <- wide_ifn_data %>%
+    filter(sampling_phase == phase) %>%
+    select(-sampling_phase)   # remove the column (not needed in sheet)
+  
+  addWorksheet(wb, sheetName = phase)
+  writeData(wb, phase, df_phase)
+}
+
+# Save to Excel
+#saveWorkbook(wb, "aab levels_binary robust z scores thr 3p5_by_phase_250930.xlsx", overwrite = TRUE)
+
+```

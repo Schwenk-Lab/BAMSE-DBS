@@ -1,0 +1,155 @@
+---
+title: "make_data_files_with_ben_norm"
+author: "Annika Bendes"
+date: "05/07/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Bare-bead normalisation by a mixture model approach
+===================================================
+
+Code for the normalisation was written by Ben in the Julia programming language. The Julia script is run using bash code in the chunk below, in a separate Conda environment containing a Julia installation.
+
+```{r}
+
+# write.csv(data_list$mfi %>%
+#             # Label samples to not use in the model ("Blank")
+#             mutate(Sample = case_when(grepl("^X", unique_sample_name) ~ "Sample",
+#                                       grepl("NL\\.neg", unique_sample_name) ~ "Negctrl",
+#                                       T ~ "Empty")) %>%
+#             # mutate(Sample = case_when(grepl("blank", unique_sample_name, ignore.case = T) ~ "Empty",
+#             #                           T ~ "Sample")) %>%
+#             relocate(Sample),
+#           file = paste0(out_dir, "../temporary_output/mixmod_in.csv"),
+#           row.names = F)
+
+out_dir = "./norm_dir/"
+
+mm_in <- mfi_layout_all_plates %>%
+            #filter()
+            select( sample_name, class, !!beadstock_info$`Antigen description`) %>%
+            rename_with(.fn=function(x){make.names(x)}) %>%
+            #select(-contains(c("spike", "rbd"), ignore.case = T)) %>%
+            # Label samples to not use in the model ("Blank")
+            mutate(class = case_when(class == "Sample" ~ "Sample",
+                                     class == "neg_ctrl" ~ "Negctrl",
+                                     T ~ "Empty"))
+write.csv(mm_in,
+          file = paste0(out_dir, "mixmod_in.csv"),
+          row.names = F)
+
+```
+
+
+```{bash, engine.opts='-l', class.source = "fold-show"}
+# julia_env.yml contains the parameters used for creating the Conda environment
+
+conda deactivate
+
+# Environment containing Julia
+conda activate julia_env
+
+julia norm_dir/ben_mixmod.jl
+
+conda deactivate
+```
+
+
+```{r}
+
+# julia_env with julia in julia_env.yml to run julia script from Ben
+system("conda run -n julia_env julia norm_dir/ben_mixmod.jl")
+
+```
+
+```{r}
+# Load normalised data, contains both raw and normalised data, keep only normalised columns
+igmnorm_mfi <- read.csv(paste0(out_dir, "WithAdjusted.csv")) %>%
+  dplyr::select(sample_name, class, ends_with("_corrected_log2")) %>%
+  rename_with(., function(x) {
+    gsub("_corrected_log2", "", x)
+  })
+
+igmnorm_mfi[3:74] <- apply(igmnorm_mfi[3:74], 2, as.numeric)
+mm_in[3:74] <- apply(mm_in[3:74], 2, as.numeric)
+
+
+
+if (TRUE) {
+  nonblank_ind <- igmnorm_mfi$class != "Empty"
+  
+  lines <- read.csv(paste0(out_dir, "line_df.csv"))
+  
+  pdf(paste0(out_dir,
+             format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+             "_mixmod_before_after_color by phase.pdf"),
+      onefile = T, width = 12, height = 5)
+  for (i in colnames(igmnorm_mfi)[-c(1, 2)]) {
+    
+    plt_dat <- data.frame("samp_name" = igmnorm_mfi$sample_name) %>%
+      mutate("Raw" = log2(mm_in[match(samp_name, mm_in$sample_name), i]),
+             "Normalised" = igmnorm_mfi[, i],
+             "Rabbit.IgG" = log2(mm_in[match(samp_name, mm_in$sample_name), "Rabbit.IgG"])) %>%
+      mutate(Sample_type = case_when(grepl("blank", samp_name, ignore.case = T) ~ "Blank",
+                                     grepl("pool", samp_name, ignore.case = T) ~ "Pool",
+                                     grepl("NL\\.neg", samp_name, ignore.case = T) ~ "Neg ctrl",
+                                     grepl("NL\\.pos", samp_name, ignore.case = T) ~ "Pos ctrl",
+                                     T ~ "Sample")) %>%
+      mutate(visit = case_when(grepl("A1_", samp_name, ignore.case = T) ~ "Phase 1",
+                               grepl("A2_", samp_name, ignore.case = T) ~ "Phase 2",
+                               grepl("A3_", samp_name, ignore.case = T) ~ "Phase 3",
+                               grepl("blank", samp_name, ignore.case = T) ~ "Blank",
+                                     grepl("pool", samp_name, ignore.case = T) ~ "Pool",
+                                     grepl("NL\\.neg", samp_name, ignore.case = T) ~ "Neg ctrl",
+                                     grepl("NL\\.pos", samp_name, ignore.case = T) ~ "Pos ctrl",
+                               ) )
+    
+    p_before <- ggplot(plt_dat) +
+      geom_point(aes(x = Rabbit.IgG, y = Raw, colour = visit)) + # colour = Sample_type
+      geom_segment(data = lines %>% filter(protein == i),
+                   aes(x = mi_val, xend = ma_val,
+                       y = o_m_val * mi_val + o_c_val, yend = o_m_val * ma_val + o_c_val)) +
+      scale_colour_brewer(palette = "Set2")
+    
+    # Blank deviation for plot subtitle
+    mean_blank_dev <- lines %>% filter(protein == i) %>%
+      summarise(mbd = mean(plt_dat$Raw[!nonblank_ind] - (o_m_val * plt_dat$Rabbit.IgG[!nonblank_ind] + o_c_val))) %>%
+      pull(mbd)
+    
+    p_after <- ggplot(plt_dat) +
+      geom_point(aes(x = Rabbit.IgG, y = Normalised, colour = visit)) + #colour = Sample_type
+      scale_colour_brewer(palette = "Set2")
+    
+    p_both <- p_before + p_after +
+      plot_layout(guides = "collect") +
+      plot_annotation(title = i, subtitle = paste0(
+        "m=", lines[lines$protein == i, "o_m_val"], "; Mean Blank deviation=", mean_blank_dev
+      )) &
+      theme_bw() &
+      theme(axis.line = element_line(size = 1),
+            axis.text = element_text(size = 12),
+            axis.title = element_text(size = 12),
+            plot.title = element_text(size = 15))
+    
+    print(p_both)
+  }
+  dev.off()
+}
+
+igmnorm_mfi <- igmnorm_mfi %>% dplyr::select(-class)
+rownames(igmnorm_mfi) <- igmnorm_mfi$sample_name
+
+data_list_bbmm <- data_list
+data_list_bbmm$mfi <- igmnorm_mfi
+data_list_bbmm$mfi_sinfo[
+  match(data_list_bbmm$mfi$sample_name, data_list_bbmm$mfi_sinfo$sample_name),
+  colnames(data_list_bbmm$mfi)[-1]
+] <- data_list_bbmm$mfi[, -1]
+data_list_bbmm$comment <- "Log2 data normalised using bare bead 2 with a mixture model, DBS vaccination serology"
+
+
+```

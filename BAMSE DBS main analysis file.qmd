@@ -1,0 +1,4557 @@
+---
+title: "BAMSE DBS"
+author: "AB"
+format: html
+editor: visual
+---
+
+## Load packages and functions:
+
+```{r}
+library(tidyverse)
+library(OlinkAnalyze)
+library(ggbeeswarm)
+library(ggpubr) 
+library(rstatix)i
+library(patchwork)
+library(emmeans)
+library(readxl)
+library(ghibli)
+library(lubridate)
+
+
+## Load funcitons:
+source("plot_dimred.R")
+source("comp_groups.R")
+
+```
+
+## Load data (Luminex, Olink and sample information):
+
+```{r}
+serology_norm <- read.csv("BAMSE_serology_log2_bb_igm_normalized_data.csv")
+
+samp_info_key <- read.csv("./datafiles/sample_information/bamse_sampleid_key_v2.csv")
+sample_info_key <- samp_info_key
+
+cluster_5prot_info <- ("cluster_information_bamse_subjects_hierarchical5protein_maximumdist.csv")
+
+empty_disc_list <- read_excel("empty_disc_list.xlsx")
+
+olink_bamse_protpqn_blank_rm_intnorm <- read.csv("protPQN intensity normalized bamse data_241004.csv")
+
+
+## Sample information:
+sample_info <- read.csv("normalized serology data with sample information_bamse samples_240627.csv")
+sample_info <- sample_info[,c(2:38,110:122) ]
+
+# Wide sample info:
+sample_info_wide <- read.csv("BAMSE C19 2023-03-06_v2.csv")
+
+## Updated sampling dates:
+sampling_date_updated <- read.csv("./sample_data/Datum_Filterpapper_korrigerad_250227.csv")
+
+### Cell count data:
+bc_data <- read_excel("BAMSE_C19_Blodstatus.xlsx")
+bc_data <- bc_data %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "(?<!\\d)\\.(\\d)", "0.\\1")))
+
+bc_data <- bc_data %>%
+  mutate(across(c(basgran_c19, eosgran_c19, erytrocyt_c19, evf_c19, leukocyt_c19, lymfocyt_c19,  monocyt_c19, neutgran_c19 ), as.numeric))
+
+
+## Remove the samples with empty discs from the serology data:
+empty_disc_samp <- empty_disc_list |>
+  filter(No_blood == 1) |>
+  pull(sample_name...8). # Containt the sample names
+
+serology_norm_rm_empty <- serology_norm |>
+  rename(sample_name = X) |>
+  filter(!sample_name %in% empty_disc_samp)
+
+## Combine data with sample information:
+serology_norm_rm_empty_sinfo <- serology_norm_rm_empty |>
+  left_join(sample_info, by = "sample_name") |>
+  mutate(sampling_phase = plot_variable) # Change name of plot_variable to sampling_phase to make it more clear
+
+serology_norm_rm_empty_sinfo <- serology_norm_rm_empty_sinfo %>%
+  left_join(sample_info_wide[ , c("idnr", "sminet_date", "IgG_bamse")], by = "idnr") |>
+  mutate(
+    sample_date = as.Date(sample_date),
+    sminet_date = as.Date(sminet_date)
+  ) |>
+  mutate(time_diff = ifelse(sminet_date < sample_date, sample_date - sminet_date, NA))
+
+beads_of_interest <- colnames(serology_norm_rm_empty)[c(2:73)]
+covid_beads <- beads_of_interest_short[-grep("ifn|bare|anti|ebna|rabbit|^RBD$", beads_of_interest_short)]
+```
+
+### For review: Antibody signals in the different phases, just light grey lines for each subject, and then a trendline (loess smooth) for the overall pattern:
+
+```{r}
+
+## Using Z-scores:
+plots_zscore <- lapply(covid_beads, function(bead) {
+  ggplot(serology_norm_rm_empty_sinfo, aes(x = sampling_phase, y = scale(.data[[bead]], scale= TRUE, center = TRUE))) +
+    geom_line(aes(group = idnr), color = "lightgrey", alpha = 0.3) + 
+    labs(title = paste0(bead), x = "Sampling phase") +
+    theme_classic() +
+    ylab(paste0("Z-score.", bead)) + 
+    guides(fill = "none", color = "none") +
+    geom_smooth(aes(group = 1), method = "loess", se = FALSE, color = "black", formula = 'y ~ x')
+})
+
+# Transform data to be relative to Phase 1 per individual
+serology_relative <- serology_norm_rm_empty_sinfo %>%
+  group_by(idnr) %>%
+  mutate(across(all_of(covid_beads), function(x) {
+    # Extract the value at Phase 1 for a specific person
+    baseline <- x[sampling_phase == "Phase 1"]
+    
+    # If they are missing Phase 1, or have multiple records, fallback to NA
+    if (length(baseline) != 1) {
+      return(NA_real_) 
+    }
+    
+    # Otherwise: perform the subtraction
+    return(x - baseline)
+  })) %>%
+  ungroup() %>%
+  # Clean up individuals who couldn't be normalized (missing Phase 1)
+  filter(!is.na(.data[[covid_beads[1]]]))
+
+plots_relative <- lapply(covid_beads, function(bead) {
+  ggplot(serology_relative, aes(x = sampling_phase, y = .data[[bead]])) +
+    geom_line(aes(group = idnr), color = "lightgrey", alpha = 0.3) + 
+    # Horizontal reference line at 0 to emphasize no-change
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkgrey", alpha = 0.7) +
+    labs(title = paste0(bead), x = "Sampling phase") +
+    theme_classic() +
+    ylab(paste0("Relative change to Phase 1")) + 
+    guides(fill = "none", color = "none") +
+    # Trendline showing population average change over time
+    geom_smooth(aes(group = 1), method = "loess", se = FALSE, color = "black", formula = 'y ~ x')
+})
+
+```
+
+### Sampling time plots in relation to vaccination (Figure 1b):
+
+```{r}
+
+sample_info_extended <- sample_info |>  left_join(sample_info_wide %>% select(idnr, chc19aldy, qc19_3aldy, IgG_bamse, male, smoke_c19_3, BMI_c19, qc19_3q9_1_yes, qc19_3q9_2_yes, c19_3_postcovid_symp, sminet_date  ), by = c("idnr_pad" = "idnr"))
+
+serology_norm_rm_empty_sinfo <- serology_norm_rm_empty_sinfo |>
+  left_join(sample_info_wide %>% select(idnr, chc19aldy, qc19_3aldy, IgG_bamse, male, smoke_c19_3, BMI_c19, qc19_3q9_1_yes, qc19_3q9_2_yes, c19_3_postcovid_symp, sminet_date  ), by = c("idnr_pad" = "idnr"))
+
+ggplot( serology_norm_rm_empty_sinfo, aes( x = as.Date(sampling_time), fill = sampling_phase)) +
+  geom_histogram( col = "white") +
+  theme_classic() +
+  labs(
+    x = "Sampling date",
+    y = "Number of Samples",
+    fill = "Sampling Phase",
+    title = "Number of samples per date"
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+long_dates <- serology_norm_rm_empty_sinfo |>
+  mutate( sampling_time = as.Date(sampling_time),
+          dose1 = as.Date(date1),
+          dose2 = as.Date(date2),
+          dose3 = as.Date(date3),
+          sminet_date = as.Date(sminet_date),
+          
+          
+          dose1 = if_else(dose1 <= sampling_time, dose1, as.Date(NA)),
+          dose2 = if_else(dose2 <= sampling_time, dose2, as.Date(NA)),
+          dose3 = if_else(dose3 <= sampling_time, dose3, as.Date(NA)),
+          sminet_date = if_else(sminet_date <= sampling_time, sminet_date, as.Date(NA))
+          
+  ) |>
+  select(sample_name, sampling_time, sampling_phase, dose1, dose2, dose3, sminet_date) |>
+  pivot_longer(
+    cols = c(sampling_time, dose1, dose2, dose3, sminet_date),
+    names_to = "date_type",
+    values_to = "date"
+  ) |>
+  mutate(
+    date = as.Date(date)
+  )
+
+### Color the phases differentyly:
+plot_data <- long_dates |>
+  filter(date_type != "sminet_date") |>
+  mutate(
+    date_type = as.character(date_type),
+    fill_group = if_else(
+      date_type == "sampling_time",
+      sampling_phase,
+      date_type
+    )
+  )
+
+ggplot(plot_data, aes(x = date, fill = fill_group)) +
+  geom_histogram(
+    col = "white",
+    alpha = 0.8,
+    position = "stack",
+    binwidth = 20
+  ) +
+  facet_wrap(
+    ~ factor(date_type, levels = c("sampling_time", "dose1", "dose2", "dose3")),
+    ncol = 1,
+    scales = "free_y"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Phase 1" = "#66C2A5",
+      "Phase 2" = "#FC8D62",
+      "Phase 3" = "#8DA0CB",
+      "dose1" = "#aed6f1",
+      "dose2" = "#93c47d",
+      "dose3" = "#004953"
+    )
+  ) +
+  scale_x_date(
+    date_breaks = "2 month",
+    date_labels = "%Y-%m"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Number of samples across different dates",
+    x = "Date",
+    y = "Number of samples",
+    fill = ""
+  )
+
+```
+
+### Age distribution per sex (Fig. 1c):
+
+```{r}
+# Load age from phase 1:
+age_bamse_df <- read.csv("bamse_age_all_phases.csv")
+
+plot_data <- serology_norm_rm_empty_sinfo |>
+  select(idnr, male, sampling_phase) |>
+  filter( sampling_phase == "Phase 1") |>
+  left_join(age_bamse_df, by = "idnr") |>
+  distinct(idnr, .keep_all = TRUE) |>  # Keep only unique idnr
+  mutate(sex = case_when( 
+    male == "1" ~ "Male",
+    male == "0" ~ "Female"
+  ))
+
+mean_value <- plot_data %>%
+  group_by(sex) %>%
+  summarize(mean = mean(qc19_1aldy))
+
+median_value <- plot_data %>%
+  group_by(sex) %>%
+  summarize(median = median(qc19_1aldy))
+
+ggplot(plot_data, aes(x = qc19_1aldy, col = sex)) +
+  geom_density(size = 2) +
+  theme_classic(base_size = 12) +
+  labs(x = "Age", y = "Density", title = "Age (Phase 1) distribution by sex", subtitle = "median = dotted, mean = dashed") +
+  scale_color_manual(values = c("Male" = "#697", "Female" = "#eac14a")) +
+  geom_vline(data = mean_value, aes(xintercept = mean, color = sex), linetype = "dashed") +
+  geom_vline(data = median_value, aes(xintercept = median, color = sex), linetype = "dotted") 
+```
+
+### Distribution of vaccination doses per sampling phase (Figure 1d):
+
+```{r}
+date_matrix <- serology_norm_rm_empty_sinfo |>
+  mutate( dose1 = as.Date(date1),
+          dose2 = as.Date(date2),
+          dose3 = as.Date(date3),
+          sminet_date = as.Date(sminet_date)) |>
+  select(sample_name, sampling_time, sampling_phase, dose1, dose2, dose3, sminet_date)
+
+
+# Categorize samples based on the number of doses at sampling_time
+date_matrix <- date_matrix %>%
+  mutate(
+    dose_count = case_when(
+      is.na(dose1) & is.na(dose2) & is.na(dose3) ~ "0 doses",  # No doses at all
+      sampling_time < dose1 ~ "0 doses",  
+      sampling_time >= dose1 & (sampling_time < dose2 | is.na(dose2)) ~ "1 dose",  
+      sampling_time >= dose2 & (sampling_time < dose3 | is.na(dose3)) ~ "2 doses",  
+      sampling_time >= dose3 ~ "3 doses",  
+      TRUE ~ NA_character_
+    )
+  )
+
+source("comp_groups.R")
+
+plot_obj <- comp_groups(date_matrix$sampling_phase, date_matrix$dose_count, p_adj_method = "fdr", p_stars = TRUE, discr_palette =  scale_fill_manual(values = c(
+  "0 doses" = "#c0c0c0",  # Red
+  "1 dose" = "#aed6f1",   # Blue
+  "2 doses" = "#93c47d",  # Green
+  "3 doses" =  "#004953"   # Purple
+)) )
+```
+
+### Samling time in relation to infection and distribution of PCR-confirmed infections per sampling phase (Supplementary Figure 1 a and b):
+
+```{r}
+plot_data <- long_dates |>
+  filter(!(date_type %in% c("dose1", "dose2", "dose3"))) |>
+  mutate(
+    date_type = as.character(date_type),
+    fill_group = if_else(
+      date_type == "sampling_time",
+      sampling_phase,
+      date_type
+    )
+  )
+
+# Create the plot
+plot <- plot_data |> 
+  # filter(!(date_type %in% c("dose1", "dose2", "dose3"))) |>
+  #  mutate( date_type = as.character(date_type)) |>
+  ggplot( aes(x = date,  fill = fill_group)) +
+  # Barplot for all date types
+  geom_histogram(
+    aes(
+      fill = ifelse(date_type == "sampling_time", sampling_phase, date_type)
+    ),
+    col = "white",
+    alpha = 0.8,
+    position = "stack"
+  ) +
+  facet_wrap(~ factor(date_type, levels = c("sampling_time", "sminet_date")), ncol = 1, scales = "free_y") +
+  theme_classic() +
+  labs(
+    x = "Date",
+    y = "Number of samples",
+    fill = "",
+    title = "Confirmed infection across different dates"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "1" = "#66C2A5",
+      "2" = "#FC8D62",
+      "3" = "#8DA0CB",
+      "sminet_date" = "#c3bfa1"
+    )
+  ) +
+  # Add more x-axis ticks
+  scale_x_date(
+    date_breaks = "3 month",  
+    date_labels = "%Y-%m"    
+  ) + 
+  theme(
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+source("comp_groups.R")
+
+# Categorize samples based on the number of doses at sampling_time
+date_matrix <- date_matrix %>%
+  mutate(
+    dose_count = case_when(
+      is.na(dose1) & is.na(dose2) & is.na(dose3) ~ "0 doses",  # No doses at all
+      sampling_time < dose1 ~ "0 doses",  
+      sampling_time >= dose1 & (sampling_time < dose2 | is.na(dose2)) ~ "1 dose",  
+      sampling_time >= dose2 & (sampling_time < dose3 | is.na(dose3)) ~ "2 doses",  
+      sampling_time >= dose3 ~ "3 doses",  
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    infected = case_when(
+      sampling_time > sminet_date ~ "Infected",
+      TRUE ~ "Unknown"
+    )
+  )
+
+plot_obj <- comp_groups(date_matrix$sampling_phase, date_matrix$infected, p_adj_method = "fdr", p_stars = TRUE, discr_palette =  scale_fill_manual(values = c(
+  "Unknown" = "grey88",
+  "Infected" = "#c3bfa1"
+)) )
+
+plot_obj$plt +   labs(
+  x = "Sampling phase",
+  y = "% of samples",
+  title = "Percentage of samples with PCR-confirmed infection",
+  fill = ""
+) 
+
+plot + (plot_obj$plt +   labs(
+  x = "Sampling phase",
+  y = "% of samples",
+  title = "Percentage of samples with PCR-confirmed infection",
+  fill = ""
+) ) +  plot_layout(widths = c(2, 1))
+
+```
+
+# Serology analysis code:
+
+### Hierarchical clustering of samples based on antibody response (Figure 2a):
+
+```{r}
+library(fpc)
+
+# Define cluster characteristics:
+clust_dist <- "maximum"
+clust_method <- "ward.D2"
+n_clust <- 4
+
+
+six_prot_beads <- c("nucleocapsid.full", "nucleocapsid.c", "spike.s1" ,"spike.wt", "ba.2.rbd.omicron", "rbd.wt.sars.2")
+
+
+## Take out only normalized mfi data:
+clust_data <- serology_norm_rm_empty %>%
+  select(!grep("_0.4", colnames(serology_norm_rm_empty))) |>
+  select( all_of(six_prot_beads))
+
+
+clust_stab <- T
+# Perform stability test
+if (clust_stab) {
+  boot_clustfun <- function(x, dist_method = clust_dist, cl_method = clust_method, n_cl = n_clust) {
+    # x, matrix with data to cluster
+    
+    clust_results <- dist(x, method = dist_method) %>% hclust(method = cl_method)
+    clusts <- cutree(clust_results, n_cl)
+    
+    out_list <- list("result" = clust_results,
+                     "nc" = length(unique(clusts)),
+                     "clusterlist" = lapply(sort(unique(clusts)), function(x) {clusts == x}),
+                     "partition" = clusts,
+                     "clustermethod" = "hclust")
+  }
+  set.seed(123)
+  bs <- clusterboot(clust_data, B = 100, clustermethod = boot_clustfun, count = F)
+  #Jacard index - the size of the intersection divided by the size of the union of two label sets, is used to compare set of predicted labels for a sample to the corresponding set of labels in y_true:
+  cat("Mean Jaccard indices: ")
+  cat(bs$bootmean)
+  
+  # Get results from first run as clustering to look at
+  hcl <- bs$result$result
+} else {
+  hcl <- clust_data %>% dist(method = clust_dist) %>% hclust(method = clust_method)
+}
+
+clusterSamples <- cutree(hcl, k = n_clust)
+serology_norm_rm_empty$cluster_maximum_6prot_omi <- as.character(clusterSamples)
+
+### Plot the heatmaps
+library(ghibli)
+library(pheatmap)
+library(viridis)
+
+rownames(clust_data) <- serology_norm_rm_empty$sample_name
+rownames(serology_norm_rm_empty) <- serology_norm_rm_empty$sample_name
+
+rownames(serology_norm_rm_empty_sinfo) <- serology_norm_rm_empty_sinfo$sample_name
+
+serology_norm_rm_empty_sinfo$cov_status <- as.factor(serology_norm_rm_empty_sinfo$cov_status)
+serology_norm_rm_empty_sinfo$sampling_phase <- as.factor(serology_norm_rm_empty_sinfo$sampling_phase)
+
+annot_colours <- list("sampling_phase" = RColorBrewer::brewer.pal(4, "Set2") %>% setNames(levels(serology_norm_rm_empty_sinfo$sampling_phase)), 
+                      "cluster_maximum_6prot_omi" = as.character(ghibli_palettes$LaputaMedium[7:4] ) %>% setNames( levels( as.factor(serology_norm_rm_empty_sinfo$cluster_maximum_6prot_omi))))
+
+# The heatmap (transposed):
+heatmap_cluster_t <- pheatmap(t(clust_data), 
+                              color = viridis::magma(101),
+                              cluster_rows = T, cluster_cols = as.hclust(as.dendrogram(hcl)), clustering_distance_rows = clust_dist,
+                              clustering_method = clust_method, show_rownames = T, show_colnames = F, cutree_cols = n_clust,
+                              annotation_col = serology_norm_rm_empty_sinfo %>% select(cluster_maximum_6prot_omi, sampling_phase) ,
+                              annotation_colors = annot_colours, border_color = NA, main = paste0("Hierarchical clustering, ward.D2, ", clust_dist))
+
+
+heatmap_cluster_t
+
+
+#### Plot the Ab intensities for the clusters:
+plots <- lapply(six_prot_beads, function(bead) {
+  ggplot(serology_norm_rm_empty_sinfo, aes(x = cluster_maximum_6prot_omi, y = .data[[bead]], color = factor(cluster_maximum_6prot_omi))) +
+    geom_violin(aes( fill = cluster_maximum_6prot_omi),cex = 1.3, trim = FALSE, alpha = 0.5) +
+    geom_boxplot(width = 0.1, position = position_dodge(0.9), col = "black", alpha = 0.5) +
+    labs(title = paste0(bead), y = bead, x = "Cluster") +
+    theme_classic() +
+    #facet_wrap(~sampling_phase) +
+    scale_colour_ghibli_d("LaputaMedium", direction = -1) +
+    scale_fill_ghibli_d("LaputaMedium", direction = -1) +
+    #scale_color_manual( values = c("#D27FBF", "#96E7FF", "#4DAB71", "#FFEC98")) +
+    #scale_color_brewer( palette = "Set2") +
+    ylab(paste0("normalized log2(mfi).", bead)) + # +
+    guides( fill = "none")
+})
+
+print(plots)
+
+## Alluvial plot for cluster travel:
+library(ggalluvial)
+library(ghibli)
+
+alluvial_plot <- serology_norm_rm_empty_sinfo |>
+  select( sampling_phase, cluster_maximum_6prot_omi, idnr_pad  ) |>
+  rownames_to_column( var = "rownames") |>
+  ggplot( aes(alluvium = idnr_pad, x = sampling_phase, stratum = cluster_maximum_6prot_omi)) + 
+  #geom_alluvium(color= "grey" , alpha = 0.5) +
+  geom_flow(aes(fill = cluster_maximum_6prot_omi), col = "black" , alpha = .5) + 
+  geom_stratum( color = "black",aes(fill=cluster_maximum_6prot_omi)) +
+  scale_fill_ghibli_d("LaputaMedium", direction = -1)+
+  ylab("Number of BAMSE subjects") +
+  xlab("") +
+  ggtitle("Change in cluster-belonging")+
+  theme_classic(15)
+
+print(alluvial_plot)
+
+```
+
+### Correlation between protein variants (Supplementary Figure 2):
+
+```{r}
+
+library(GGally)
+
+
+## RBD:
+serology_norm_rm_empty_sinfo |>
+  select(contains("rbd")) |>  # Select columns containing "rbd"
+  select(-contains("0.4")) |> # Remove columns containing "0.4"
+  select(-"rbd") |>
+  select(-contains("nearly")) |>
+  select(-contains("sars.1")) |>
+  ggpairs(
+    upper = list(continuous = wrap("cor", method = "spearman")),
+    title = "RBD protein correlation"
+  )
+
+## Spike:
+serology_norm_rm_empty_sinfo |>
+  select(contains("spike")) |>  # Select columns containing "rbd"
+  select(-contains("0.4")) |> # Remove columns containing "0.4"
+  ggpairs(
+    upper = list(continuous = wrap("cor", method = "spearman")),
+    title = "Spike protein correlation"
+  )
+
+## Nucleocapsid:
+serology_norm_rm_empty_sinfo |>
+  select(contains("nucle")) |>  # Select columns containing "rbd"
+  select(-contains("0.4")) |> # Remove columns containing "0.4"
+  ggpairs(
+    upper = list(continuous = wrap("cor", method = "spearman")),
+    title = "Nucleocapsid protein correlation"
+  )
+```
+
+### Determine seropositivity using population density cutoffs
+
+Population-based threshold of 6 standard deviations (SD) of the estimated negative proportion above the Gaussian population peak. The negative population consisted of unvaccinated individuals without PCR-confirmed infection in sampling phase 1 & 2.
+
+```{r}
+dens_cl <- function(x, s, neg_prop, fullx_phase, method) {
+  
+  # Exclude controls and pools
+  x_pop <- x
+  
+  # Save a cutoff, population density peak, and plot per protein
+  cutoff_vec = peak_vec <- vector("numeric", ncol(x_pop))
+  names(cutoff_vec) = names(peak_vec) <- colnames(x_pop)[1:(ncol(x_pop))]
+  
+  plt_lst <- vector("list", ncol(x_pop))
+  names(plt_lst) <- colnames(x_pop)[1:(ncol(x_pop))]
+  
+  plt_lst2 <- vector("list", ncol(fullx_phase))
+  names(plt_lst2) <- colnames(fullx_phase)[1:(ncol(fullx_phase))]
+  
+  for (prot in colnames(x_pop)[1:(ncol(x_pop))]) {
+    val <- x_pop[, prot]
+    
+    # Get population density peak and distance from peak
+    dens <- density(val)
+    peak <- dens$x[which.max(dens$y)]
+    pdist <- abs(val - peak)
+    
+    # Get variation of neg_prop around peak
+    qtl <- quantile(pdist, probs = neg_prop)
+    vtn <- sd(val[pdist <= qtl])
+    
+    # Classify points
+    # Use a cutoff of peak - 6 for selected binders (due to high prevalence instead of low)
+    cutoff <- peak + ifelse(grepl("anti.human|ebna", prot, ignore.case = T), -6, 6) * vtn
+    
+    peak_vec[prot] <- peak
+    cutoff_vec[prot] <- cutoff
+    
+    # Make plot
+    p <- ggplot(x_pop %>% dplyr::select(!!prot)) +
+      geom_histogram(aes_string(x = prot), size = 1.2, fill = "white", col = "grey30") +
+      geom_vline(xintercept = peak, linetype = "dashed") +
+      geom_vline(xintercept = cutoff, linetype = "dotted") +
+      labs( title = "Phase 1 and 2",
+            subtitle = method) +
+      theme_classic() +
+      theme(axis.line = element_line(size = 1),
+            axis.text = element_text(size = 14),
+            axis.title = element_text(size = 16))
+    
+    plt_lst[[prot]] <- p
+    
+    # Make plot on all sample phases:
+    p <- ggplot(fullx_phase %>% dplyr::select(!!prot)) +
+      geom_histogram(aes_string(x = prot), size = 1.2, fill = "white", col = "grey30") +
+      geom_vline(xintercept = peak, linetype = "dashed") +
+      geom_vline(xintercept = cutoff, linetype = "dotted") +
+      labs( title = "All phases",
+            subtitle = method) +
+      theme_classic() +
+      theme(axis.line = element_line(size = 1),
+            axis.text = element_text(size = 14),
+            axis.title = element_text(size = 16))
+    
+    plt_lst2[[prot]] <- p
+    
+    
+  }
+  
+  return(list("cutoffs" = cutoff_vec,
+              "peaks" = peak_vec,
+              "plots_cutoffs" = plt_lst,
+              "plots_all_phases" = plt_lst2))
+}
+
+# Estimated proportion of positive samples from vaccinations and infections in phase 1 and 2:
+serology_norm_rm_empty_sinfo <- serology_norm_rm_empty_sinfo |>
+  mutate( cov_status = case_when( is.na(sminet_case) & is.na(vaccdose1) ~ "V-I-",
+                                   is.na(sminet_case) & vaccdose1 == "Yes" ~ "V+I-",
+                                   sminet_case=="Yes" & is.na(vaccdose1) ~ "V-I+",
+                                   sminet_case=="Yes" & vaccdose1 == "Yes" ~ "V+I-",
+                                   ))
+
+
+filtered_data <- serology_norm_rm_empty_sinfo |> 
+  filter( sampling_phase %in% c("Phase 1", "Phase 2"))
+
+# Calculate the number of rows matching cov_status conditions
+matching_rows <- filtered_data |> 
+  filter(cov_status %in% c("V-I+", "V+I-", "V+I+") | IgG_bamse == 1 ) |> 
+  nrow()
+# Calculate the total number of rows in the filtered dataset
+total_rows <- nrow(filtered_data)
+# Calculate the proportion
+pos_prop <- matching_rows / total_rows
+
+# Make cutoffs for each covid19 protein, INF protein and EBNA1
+binfo <- data.frame(beads_of_interest)
+colnames(binfo)[1] <- "analyte"
+binfo$analyte_number <- 1:72
+
+prot_incl <- binfo[-grep("bare|rabbit", binfo$analyte), 2]
+mfi <- filtered_data[,c(2:73)]
+sinfo <- filtered_data[,74:ncol(filtered_data)]
+
+method <- "Density peak for P1&2 + 6SD(estimated neg)"
+dens_cutoffs <- dens_cl(mfi[, c(prot_incl)], sinfo, 1 - pos_prop, serology_norm_rm_empty_sinfo[,c(2:73)], method)
+
+
+# Classify all samples (including controls) for each protein
+cls <- serology_norm_rm_empty_sinfo[, c("sample_name", names(dens_cutoffs$cutoffs))]
+for (i in colnames(cls)[-1]) {
+  cls[, i] <- cls[, i] > dens_cutoffs$cutoffs[i]
+}
+
+#      Create a summary table with % of TRUE/FALSE for each antibody:
+
+# Reshape the data from wide to long format
+long_cls <- cls |>
+  pivot_longer(
+    cols = -sample_name,   # Exclude the first column (sample_name)
+    names_to = "protein",  # Create a 'protein' column with the protein names
+    values_to = "value"    # Create a 'value' column with the corresponding TRUE/FALSE values
+  )
+
+# Calculate the percentage of TRUE and FALSE per protein
+seropos_summary_table <- long_cls |>
+  #group_by(protein) |>
+  #mutate(total_count = n() ) |>
+  #ungroup() |>
+  group_by(protein, value) |>               # Group by protein and value (TRUE/FALSE)
+  summarise(count = n()) |> # Count the number of TRUE and FALSE values per protein
+  mutate(percentage = count / sum(count) * 100)
+
+# Calculate the percentage of TRUE and FALSE per protein and phase
+seropos_summary_table_phase <- long_cls |>
+  left_join(serology_norm_rm_empty_sinfo |> select( c("sample_name", "sampling_phase")), by = "sample_name") |>
+  group_by(sampling_phase, protein, value) |>   # Group by protein and value (TRUE/FALSE)
+  summarise(count = n()) |> # Count the number of TRUE and FALSE values per protein
+  mutate(percentage = count / sum(count) * 100)
+
+```
+
+### Check how many are considered sero +/- per serocluster:
+
+```{r}
+
+# Create a summary table with % TRUE/FALSE per cluster:
+
+# Initialize an empty list to store the small tables
+seropos_cluster_comp <- list()
+
+# Use lapply to create a list of tables, one for each protein
+seropos_cluster_comp <- lapply(unique(seropos_summary_table$protein), function(prot) {
+  
+  # Filter the data for the current protein
+  protein_data <- long_cls |>
+    left_join(serology_norm_rm_empty_sinfo[, c("sample_name", "sampling_phase", "IgG_bamse", "cluster_maximum_6prot_omi")]) |>
+    filter(protein == prot)
+  
+  # Create a contingency table
+  contingency_table <- table(protein_data$cluster_maximum_6prot_omi, protein_data$value)
+  
+  # Convert to data frame for easier manipulation
+  df <- as.data.frame.matrix(contingency_table)
+  
+  
+  return(df)
+})
+
+# Assign names to the list elements based on the protein names
+names(seropos_cluster_comp) <- unique(seropos_summary_table$protein)
+
+### Write it as a table:
+seropositive_clusters_df <- map_dfr(covid_proteins, function(name) {
+  # Extract the table for the current protein
+  tbl <- seropos_cluster_comp[[name]] %>% 
+    as.data.frame() %>% 
+    rownames_to_column(var = "Serocluster") # Convert row names to a column
+  
+  # Ensure both "FALSE" and "TRUE" columns exist, replacing missing ones with 0
+  if (!"FALSE" %in% colnames(tbl)) {
+    tbl$`FALSE` <- 0
+  }
+  if (!"TRUE" %in% colnames(tbl)) {
+    tbl$`TRUE` <- 0
+  }
+  
+  # Create a data frame with required columns
+  tbl %>%
+    mutate(
+      analyte = name, # Add analyte column
+      percent_true = round(`TRUE` / (`FALSE` + `TRUE`) * 100, 1) # Calculate percentage
+    ) %>%
+    select(analyte, Serocluster, `FALSE`, `TRUE`, percent_true) # Reorder columns
+})
+
+
+
+### Seroclusters per phase:
+# Initialize an empty list to store the small tables
+seropos_cluster_comp_perphase <- list()
+
+# Use lapply to create a list of tables, one for each protein
+seropos_cluster_comp_perphase <- lapply(unique(covid_proteins), function(prot) {
+  
+  # Filter the data for the current protein
+  protein_data <- long_cls |>
+    left_join(serology_norm_rm_empty_sinfo[, c("sample_name", "sampling_phase", "IgG_bamse", "cluster_maximum_6prot_omi")], by = "sample_name") |>
+    filter(protein == prot)
+  
+  # Create a contingency table for sampling_phase & cluster vs. value
+  contingency_table <- table(protein_data$sampling_phase, protein_data$cluster_maximum_6prot_omi, protein_data$value)
+  
+  # Convert the array to a tidy data frame
+  df <- as.data.frame.table(contingency_table) |> 
+    rename(sampling_phase = Var1, cluster = Var2, value = Var3, count = Freq) |> 
+    pivot_wider(names_from = value, values_from = count, values_fill = list(count = 0)) |> 
+    rename(`FALSE` = `FALSE`, `TRUE` = `TRUE`)
+  
+  return(df)
+})
+
+
+names(seropos_cluster_comp_perphase) <- unique(covid_proteins)
+
+### Write it as a table:
+seropositive_clusters_phase_df <- map_dfr(covid_proteins, function(name) {
+  # Extract the table for the current protein
+  tbl <- seropos_cluster_comp_perphase[[name]] %>% 
+    as.data.frame() #%>% 
+  #rownames_to_column(var = "Serocluster") # Convert row names to a column
+  
+  # Ensure both "FALSE" and "TRUE" columns exist, replacing missing ones with 0
+  if (!"FALSE" %in% colnames(tbl)) {
+    tbl$`FALSE` <- 0
+  }
+  if (!"TRUE" %in% colnames(tbl)) {
+    tbl$`TRUE` <- 0
+  }
+  
+  # Create a data frame with required columns
+  tbl %>%
+    mutate(
+      analyte = name, # Add analyte column
+      percent_true = round(`TRUE` / (`FALSE` + `TRUE`) * 100, 1) # Calculate percentage
+    ) %>%
+    select(analyte, sampling_phase, cluster, `FALSE`, `TRUE`, percent_true) # Reorder columns
+})
+
+
+```
+
+### Agreement across RBD variants (Supplementary Figure 3):
+
+Let the RBD WT variant be 100%, and then the percentage of positive for the other variants, sort in decreasing order.
+
+```{r}
+rbd_variants <- colnames(cls)[grep("rbd", colnames(cls))]
+rbd_variants <- rbd_variants[-grep("^rbd$|0.4", rbd_variants)]
+
+reference_col <- "rbd.wt.sars.2"  # Define reference variant
+
+rbd_agreement_df <- cls |>
+  select( sample_name, all_of(rbd_variants)) |>
+  left_join(
+    serology_norm_rm_empty_sinfo |>
+      select(sample_name, sampling_phase, idnr),
+    by = "sample_name"
+  ) 
+
+# Count number of samples positive for reference
+total_reference_positive <- sum(rbd_agreement_df[[reference_col]] == "TRUE", na.rm = TRUE)
+
+# Compute agreement percentage for each variant
+agreement_results <- lapply(rbd_variants, function(variant) {
+  # Count samples where reference is TRUE and variant is also TRUE
+  agreement_count <- sum(rbd_agreement_df[[variant]] == "TRUE" & rbd_agreement_df[[reference_col]] == "TRUE", na.rm = TRUE)
+  
+  # Compute percentage agreement
+  percentage_agreement <- (agreement_count / total_reference_positive) * 100
+  
+  return(data.frame(variant = variant, percentage = percentage_agreement))
+}) |> 
+  bind_rows()
+
+
+# Step 3: Sort variants by agreement percentage (highest to lowest)
+agreement_results <- agreement_results |> arrange(desc(percentage))
+
+# Step 4: Visualize as a bar plot
+agreement_results |> filter(! variant == "rbd.nearly.omicron") |>
+  ggplot( aes(x = reorder(variant, -percentage), y = percentage)) +
+  geom_bar(stat = "identity", width = 1, show.legend = FALSE, alpha = 0.6, col = "white", fill = "grey", size=2) +
+  theme_classic(base_size = 12) +
+  labs(title = "Agreement of RBD Variants with rbd.wt",
+       x = "RBD Variant",
+       y = "Agreement Percentage (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline( yintercept = 75, linetype = "dashed")
+
+```
+
+### Agreement between Luminex data (DBS) and ELISA (Plasma) (Supplementary Figure 4):
+
+```{r}
+
+# Create a summary table for phase 2 with how many are positive in this assay and how many are in the ELISA:
+# Initialize an empty list to store the small tables
+seropos_elisa_comp <- list()
+
+# Use lapply to create a list of tables, one for each protein
+seropos_elisa_comp <- lapply(unique(seropos_summary_table$protein), function(prot) {
+  
+  # Filter the data for the current protein
+  protein_data <- long_cls |>
+    left_join(serology_norm_rm_empty_sinfo[, c("sample_name", "sampling_phase", "IgG_bamse", "cluster_maximum_6prot_omi")]) |>
+    filter( sampling_phase == "Phase 2")  |>
+    filter(protein == prot)
+  
+  # Create a contingency table
+  contingency_table <- table(protein_data$IgG_bamse, protein_data$value)
+  
+  # Convert to data frame for easier manipulation
+  df <- as.data.frame.matrix(contingency_table)
+  
+  
+  return(df)
+})
+
+# Assign names to the list elements based on the protein names
+names(seropos_elisa_comp) <- unique(seropos_summary_table$protein)
+
+## Save it to a df:
+seropositive_elisa_df <- map_dfr(names(seropos_elisa_comp), function(name) {
+  # Extract the table for the current protein
+  tbl <- seropos_elisa_comp[[name]] %>% 
+    as.data.frame() %>% 
+    rownames_to_column(var = "ELISA_IgG_pos") # Convert row names to a column
+  
+  
+# Ensure both "FALSE" and "TRUE" columns exist, replacing missing ones with 0
+  if (!"FALSE" %in% colnames(tbl)) {
+    tbl$`FALSE` <- 0
+  }
+  if (!"TRUE" %in% colnames(tbl)) {
+    tbl$`TRUE` <- 0
+  }
+  
+  # Create a data frame with required columns
+  tbl %>%
+    mutate(
+      analyte = name, # Add analyte column
+      percent_true = round(`TRUE` / (`FALSE` + `TRUE`) * 100, 1) # Calculate percentage
+    ) %>%
+    select(analyte, ELISA_IgG_pos, `FALSE`, `TRUE`, percent_true) # Reorder columns
+})
+
+cohen_kappa_df <- NULL
+for (protein in covid_beads){
+  df_temp <- seropositive_elisa_df |>
+    filter( analyte == protein) |>
+    select(ELISA_IgG_pos,  `FALSE`, `TRUE`) |>
+    mutate( ELISA_IgG_pos = case_when( ELISA_IgG_pos == 0 ~ "FALSE",
+                                       ELISA_IgG_pos == 1 ~ "TRUE")) |>
+    column_to_rownames("ELISA_IgG_pos") |>
+    as.matrix()
+  
+  cohen_kappa_protein <- psych::cohen.kappa(df_temp)
+  cohen_kappa_df <- rbind( cohen_kappa_df, c(protein, cohen_kappa_protein$kappa))
+  
+}
+
+## Create a file that contains seropositivity for spike proteins and their ELISA_igG:
+filtered_cls_df <- cls %>%
+  left_join(
+    serology_norm_rm_empty_sinfo %>% select(sample_name, sampling_phase, IgG_bamse),
+    by = "sample_name"
+  ) %>%
+  filter(sampling_phase == "Phase 2") %>%
+  select(sample_name, sampling_phase, IgG_bamse, contains("spike"))
+
+#Pivot longer for analysis
+long_cls_elisa_df <- filtered_cls_df %>%
+  pivot_longer(cols = contains("spike"), names_to = "spike_feature", values_to = "spike_value")
+
+summary_df <- long_cls_elisa_df %>%
+  group_by(spike_feature, spike_value, IgG_bamse) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Create the complete grid of all combinations
+all_combos <- expand_grid(
+  spike_feature = unique(summary_df$spike_feature),
+  spike_value = c(TRUE, FALSE),
+  IgG_bamse = c(0, 1)
+)
+
+# Join with actual counts and fill missing combos with 0
+summary_df_plot <- all_combos %>%
+  left_join(summary_df, by = c("spike_feature", "spike_value", "IgG_bamse")) %>%
+  mutate(
+    n = replace_na(n, 0),
+    spike_value = factor(spike_value, levels = c(FALSE, TRUE)),
+    IgG_bamse = factor(IgG_bamse, levels = c(0, 1)),
+    # Reverse the facet order
+    spike_feature = factor(spike_feature, levels = rev(unique(summary_df$spike_feature)))
+  )
+
+plot1 <- summary_df_plot |>
+  filter( !grepl("0.4", spike_feature )) |>
+  filter( !is.na(IgG_bamse)) |>
+  ggplot( aes(x = IgG_bamse, y = spike_value, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), size = 4) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  facet_wrap(~ spike_feature) +
+  labs(
+    x = "ELISA",
+    y = "Luminex assay",
+    fill = "Count",
+    title = "Seropositivity for Spike vs ELISA measured IgG"
+  ) +
+  theme_classic(base_size = 12)
+
+```
+
+### Antibody level response to vaccination and infection (Supplementary Figure 5):
+
+```{r}
+
+### Antibody levels against time since infection (Days since PCR positive)
+sminet_infected_subjects <- serology_norm_rm_empty_sinfo |> filter(sminet_case == "Yes") |> pull(idnr) |> unique()
+
+plot2 <-  serology_norm_rm_empty_sinfo %>% 
+  filter(idnr %in% sminet_infected_subjects) %>%
+  mutate(
+    time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+    time_since_sminet_group = case_when(
+      time_since_sminet < 0 ~ "pre",
+       time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+       time_since_sminet > 5 & time_since_sminet <= 10 ~ "6-10",
+       time_since_sminet > 30 ~ "30+"
+      #time_since_sminet >= 0 ~ "post",
+    ),
+    time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30",  "30+"))
+    #time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "post"))
+  ) %>%
+  filter(Time_Sample_Dose1 < 0) %>%
+  group_by(idnr) %>%
+  filter(!all(time_since_sminet_group == "pre")) |>
+  pivot_longer(cols = all_of(beads_of_interest_short), names_to = "bead", values_to = "mfi") %>%
+  filter(bead %in% c("nucleocapsid.full", "spike.wt", "rbd.wt.sars.2" )) %>%
+  ggplot(aes(x = time_since_sminet, y = mfi, fill = time_since_sminet_group)) +
+  geom_vline( xintercept = 0, linetype = "dotted", col = "grey40") +
+  geom_vline( xintercept = 30, linetype = "dotted", col = "grey40") +
+  geom_line(aes(group = idnr), color = "gray80", alpha = 0.2) +
+  geom_point(size = 3, shape = 21, col = "white" ) +
+  theme_classic() +
+  labs( y = "log2(MFI) [AU]", x = "Days since PCR+") +
+   scale_fill_manual( values = c("grey", "#e93e3a", "#fdc70c"), name = "Days since PCR+") +
+  #scale_fill_manual( values = c("grey",  "#fdc70c"), name = "+") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~bead)
+
+
+### Antibody levels against time since vaccination
+vaccinated_subjects <- serology_norm_rm_empty_sinfo |> filter(vaccdose1 == "Yes") |> pull(idnr) |> unique()
+nucleocapsid_positive_samples <- long_cls |> filter(protein == "nucleocapsid.full" & value == "TRUE") |> pull(sample_name) ## samples taken after infection
+
+serology_vaccination_data <- serology_norm_rm_empty_sinfo |>
+  #filter(vaccdose1 == "Yes" & is.na(sminet_case)) |>
+  filter( idnr %in% vaccinated_subjects) |> 
+  filter(!sample_name %in% nucleocapsid_positive_samples) |>
+  mutate(
+    sampling_time = as.Date(sampling_time),
+    dose1_date = as.Date(date1),
+    dose2_date = as.Date(date2),
+    dose3_date = as.Date(date3)
+  ) |>
+  rowwise() |>  # Process each row individually
+  mutate(
+    # Combine dose dates into a list and filter those before sampling_time
+    dose_dates = list(na.omit(c(dose1_date, dose2_date, dose3_date))),
+    dose_dates_before_sampling = list(dose_dates[dose_dates < sampling_time]),
+    
+    # Identify the closest dose date before the sampling time
+    closest_dose_date = max(dose_dates_before_sampling, na.rm = TRUE),
+    
+    # Calculate time since the closest dose in months
+    time_since_any_dose = time_length(interval(closest_dose_date, sampling_time), "days"),
+    
+    # Add the time to vaccine dose 1 to the samples that were taken before vaccination:
+    time_since_any_dose = case_when( time_since_any_dose == "Inf" ~ time_length(interval(dose1_date, sampling_time), "days"),
+                                     T ~ time_since_any_dose),
+    
+    
+    # Determine which dose was closest
+    closest_dose = case_when(
+      closest_dose_date == dose1_date ~ "dose1",
+      closest_dose_date == dose2_date ~ "dose2",
+      closest_dose_date == dose3_date ~ "dose3",
+      TRUE ~ "No dose"
+    )
+  ) |>
+  ungroup()
+
+serology_vaccination_data <- serology_vaccination_data |>
+  mutate( time_since_vaccination_group = case_when(
+    time_since_any_dose < 0 ~ "pre",
+    time_since_any_dose >= 0 & time_since_any_dose <= 5 ~ "0-5",
+    time_since_any_dose > 5 & time_since_any_dose <= 10 ~ "6-10",
+     time_since_any_dose > 10 & time_since_any_dose <= 30~ "11-30",
+     time_since_any_dose > 30 ~ "30+"
+    #time_since_any_dose >= 0 ~ "post"
+  ),
+   time_since_vaccination_group = factor(time_since_vaccination_group, levels = c("pre", "0-5",  "6-10", "11-30", "30+"))
+  #time_since_vaccination_group = factor(time_since_vaccination_group, levels = c("pre", "post"))
+) 
+
+plot <-  serology_vaccination_data |> 
+  filter(!all(time_since_vaccination_group == "pre")) |>
+  pivot_longer(cols = all_of(beads_of_interest_short), names_to = "bead", values_to = "mfi") %>%
+  filter(bead %in% c("nucleocapsid.full", "spike.wt", "rbd.wt.sars.2" )) %>%
+  filter(!is.na(time_since_vaccination_group)) |>
+  ggplot(aes(x = time_since_any_dose, y = mfi, fill = time_since_vaccination_group)) +
+  geom_vline( xintercept = 0, linetype = "dotted", col = "grey40") +
+   geom_vline( xintercept = 30, linetype = "dotted", col = "grey40") +
+  geom_line(aes(group = idnr), color = "gray80", alpha = 0.2) +
+  geom_point(size = 3, shape = 21, col = "white" ) +
+  theme_classic() +
+  #stat_compare_means(label = "p.signif", method = "t.test", ref.group = "pre") +
+  labs(y = "log2(MFI) [AU]", x = "Days since latest dose") +
+  #scale_fill_manual( values = c("grey",  "#fdc70c"), name = "") +
+  #scale_color_brewer( palette = "Set2")
+  #scale_fill_manual( values = c("grey", "#e93e3a", "#ed683c", "#f3903f", "#fdc70c"), name = "Days since latest dose") +
+  scale_fill_manual( values = c("grey", "#e93e3a","#FE8D01", "#FFC78F" , "#fdc70c"), name = "Days since latest dose") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ bead) 
+
+plot2 / plot + plot_annotation(tag_levels = 'A')
+
+## Stability of Ab levels since vaccination, no infection (based on sminet case and if they are TRUE against nucleocapsid.full for serology test (Figure S5 c & d)
+
+protein_to_plot <- c("nucleocapsid.full", "spike.s1s2.foldon")
+
+serology_norm_rm_empty_sinfo |>
+  filter(vaccdose1 == "Yes" &  is.na(sminet_case)) |>
+  filter( ! sample_name %in% nucleocapsid_positive_samples ) |>
+  mutate(
+    sampling_time = as.Date(sampling_time),
+    dose1_date = as.Date(date1),
+    time_since_dose1_months = time_length(interval(dose1_date, sampling_time), "months")
+  ) |>
+  #select( sample_name, idnr, all_of(five_prot_beads), sampling_phase, time_since_dose1_months, nr_vacc_doses ) |>
+  select( sample_name, idnr, all_of(protein_to_plot), sampling_phase, time_since_dose1_months, nr_vacc_doses ) |>
+  pivot_longer( cols=!c(sample_name, idnr, sampling_phase, time_since_dose1_months, nr_vacc_doses ), values_to = "norm.mfi", names_to = "analyte") |>
+  ggplot( aes( x = time_since_dose1_months, y = norm.mfi )) +
+  #geom_line(aes(group = idnr), alpha = 0.5) +
+  geom_point( aes(col = as.factor(nr_vacc_doses) ), alpha = 0.9, size = 2) +
+  facet_wrap(~analyte) +
+  geom_smooth(method = 'loess', col = "#E9C46A") + 
+  theme_classic(13) +
+  labs( title= "Time since vaccine dose 1", subtitle = "(excl. sminet infected and nucleocapsid.full positive)", y = "Normalized log2 MFI", x = "Months since Vaccine dose 1") +
+  #scale_color_manual(values= c("#D81B60", "#1E88E5", "#004D40"))
+  scale_color_manual(values= c("#aed6f1", "#93c47d", "#004953"))
+
+
+
+# Figure S5e
+# Assign colors per analyte
+library(ggnewscale)
+
+
+# Extract cutoff values from the data frame
+cutoff_values <- data.frame(
+  analyte = names(dens_cutoffs$cutoffs[c(nuc_protein, s_protein)]),  # Protein names
+  cutoff = dens_cutoffs$cutoffs[c(nuc_protein, s_protein)]  # Corresponding cutoff values
+)
+
+cutoff_values <- cutoff_values |>   mutate( family = case_when( analyte %in% nuc_protein ~ "N",
+                                                                analyte %in% s_protein ~ "S"))
+
+protein_colors <- c(
+  "nucleocapsid_acro" = pal_fill[3], 
+  "nucleocapsid.c" = pal_fill[4], 
+  "nucleocapsid.full" = pal_fill[5],  # Ensure nucleocapsid.full is in green shades
+  "spike.s1" = "#fea214", 
+  "spike.s1s2.foldon" = "#f78e50", 
+  "spike.wt" = "#ec7b73"
+)
+
+# Family colors for smooth curves and horizontal lines
+#family_colors <- c("N" = pal_fill[4], "S" = "#f6bc67")
+family_colors <- c("N" = "#08589E", "S" = "#f99d48")
+
+
+
+serology_norm_rm_empty_sinfo |>
+  #left_join(sample_info_wide[ , c("idnr", "sminet_date")], by = "idnr") |>
+  filter(sminet_case == "Yes" & is.na(vaccdose1)) |>
+  mutate(
+    sampling_time = as.Date(sampling_time),
+    sminet_date = as.Date(sminet_date),
+    time_since_sminet = as.numeric(sampling_time - sminet_date),
+    time_since_sminet_months = time_length(interval(sminet_date, sampling_time), "months")
+  ) |>
+  select(
+    sample_name, idnr, sampling_phase, time_since_sminet_months, all_of(c(nuc_protein, s_protein))
+  ) |>
+  pivot_longer(cols = !c(sample_name, idnr, sampling_phase, time_since_sminet_months), 
+               values_to = "norm.mfi", names_to = "analyte") |>
+  mutate(
+    family = case_when(
+      analyte %in% nuc_protein ~ "N",
+      analyte %in% s_protein ~ "S"
+    )
+  ) |>
+  ggplot(aes(x = time_since_sminet_months, y = norm.mfi)) +
+  # POINTS - Use analyte colors
+  geom_point(aes(color = analyte), alpha = 0.8, size = 2) +
+  scale_color_manual(
+    name = "Analyte", 
+    values = protein_colors  # Define colors for points (analyte)
+  ) +
+  new_scale_colour() +
+  # SMOOTH LINES - Use family colors
+  geom_smooth(method = 'loess', aes(color = family, fill = family), formula = y ~ x) +  
+  theme_classic(12) +
+  # TWO DIFFERENT COLOR MAPPINGS
+  scale_color_manual(
+    name = "Family", 
+    values = family_colors  # Define colors for points (analyte)
+  ) +
+  scale_fill_manual(
+    name = "Family", 
+    values = family_colors   # Define colors for smooth lines (family)
+  ) +
+  # HORIZONTAL LINES - Use viral protein family colors
+  geom_hline(
+    data = cutoff_values, 
+    aes(yintercept = cutoff, linetype = analyte, color = family)  
+  ) +
+  labs(
+    title = "Anti-N and S signal after infection",
+    subtitle = "Exclude vaccinated subjects",
+    y = "Normalized log2 MFI",
+    x = "Months since confirmed infection"
+  )
+
+```
+
+# Proteomics analysis code:
+
+### Linear models protein \~ traits (BMI, sex, age, smoking):
+
+```{r}
+
+library(lmerTest)
+
+model_vars <- c("chc19aldy", "male", "smoke_c19_3", "BMI_c19" )
+
+olink_proteins_oi <- colnames(olink_bamse_protpqn_blank_rm_intnorm)[c(2:(ncol(olink_bamse_protpqn_blank_rm_intnorm))-1)]
+
+# Initialize a data frame to store the results
+results_lm_p2 <- data.frame(protein = character(), var = character(), adj_R2 = numeric(), intercept = numeric(), slope = numeric(),  p_value_intercept = numeric(),  p_value_slope = numeric(), stringsAsFactors = FALSE)
+
+# Loop over each protein and each model variable
+for (protein in olink_proteins_oi) {
+  for (var in model_vars) {
+    
+    formula <- as.formula(paste(protein, "~", var))
+    
+    phase2_data <- olink_bamse_protpqn_blank_rm_intnorm_si_ex |> filter(sampling_phase == "Phase 2")
+    
+    # Fit the linear mixed model
+    model <- tryCatch(
+      lm(formula, data = phase2_data),
+      error = function(e) NULL
+    )
+    
+    adjr2 <- summary(lm(formula, data = phase2_data))$adj.r.squared
+    
+    estimates <- if (!is.null(model)) {
+      summary(model)$coefficients[, "Estimate"]
+    } else {
+      NA
+    }
+    
+    p_values <- if (!is.null(model)) {
+      summary(model)$coefficients[, "Pr(>|t|)"]
+    } else {
+      NA
+    }
+    
+    
+    results_lm_p2 <- rbind(results_lm_p2, data.frame(protein = protein, var = var,  adj_R2 = adjr2, intercept = estimates[1], slope = estimates[2] ,  p_value_intercept = p_values[1], p_value_slope =  p_values[2] ))
+    
+    
+  }
+  
+}
+
+# FDR adjust data:
+results_lm_p2 <- results_lm_p2 |> 
+  group_by(var) |> 
+  mutate(fdr_slope = p.adjust(p_value_slope, method = "fdr")) |> 
+  ungroup()
+
+write.csv(results_lm_p2, "lm phase 2 against information_protpqn intesnity data_fdr across variable_250928.csv")
+
+
+## Plot fdr vs slope:
+plot_list <- lapply(model_vars, function(variable) {
+  dat <- results_lm_p2_in |>
+    filter(var == variable) |>
+    mutate(
+      rank_sig = min_rank(fdr_slope),
+      label = case_when(
+        rank_sig <= 10 ~ protein,
+        TRUE ~ NA_character_
+      ),
+      significant_color = case_when(fdr_slope < 0.05 ~ "sig",
+                                    TRUE ~ "not sig"),
+      max_abs_slope = max(abs(slope), na.rm = TRUE)
+    )
+  
+  p <- ggplot(dat, aes(x = slope, y = -log10(fdr_slope), col = significant_color)) +
+    geom_point(alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_blank(aes(x = max_abs_slope)) +
+    geom_blank(aes(x = -max_abs_slope)) +
+    theme_classic(10) +
+    scale_color_manual(values = c("not sig" = "grey79", "sig" = "black")) +
+    ylim(0, 40) +
+    labs( title = paste0(variable)) +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # Only add geom_text if there is at least one "sig"
+  if (any(dat$significant_color == "sig")) {
+    p <- p + geom_text(
+      data = dat,
+      aes(label = label),
+      size = 3,
+      color = "black",
+      nudge_y = 0.15,
+      check_overlap = TRUE
+    )
+  }
+  
+  return(p)
+})
+
+plot_list[[4]] + plot_list[[1]] + plot_list[[2]] + plot_list[[3]] + plot_layout(guides = "collect")
+
+```
+
+### PCA plot of proteomics data and correlation between PC1-3 and clinical variables (Fig S7):
+
+```{r}
+
+olink_bamse_protpqn_blank_rm_intnorm_si <- olink_bamse_protpqn_blank_rm_intnorm |>
+  left_join(samp_info_key, by = c("sample_id" = "sampleid")) |>
+  left_join(sample_info, by = c("samplename" = "sample_name"))
+
+### Correlate all proteins as well to PC1, PC2 and PC3 together with the clinical variables:
+pca_in <- olink_bamse_protpqn_blank_rm_intnorm_si |>
+  dplyr::select( samplename, all_of(proteins_of_interest)) |>
+  column_to_rownames( var = "samplename")
+pca_in <- pca_in[ complete.cases( pca_in),]
+
+pca_result <- prcomp(pca_in[, 1:ncol(pca_in)])
+pc_scores <- as.data.frame(pca_result$x)
+
+
+pc_scores <- pc_scores %>%
+  mutate(samplename = rownames(pc_scores)) %>%
+  left_join(olink_bamse_protpqn_blank_rm_intnorm_si |> dplyr::select( samplename, sample_date, nr_vacc_doses, sampling_phase, cluster_maximum_6prot_omi ), by = "samplename") |>
+  left_join( olink_bamse_protpqn_blank_rm_intnorm_si_ex |> dplyr::select( samplename,  male, smoke_c19_3, BMI_c19,qc19_3aldy),  by = "samplename") |>
+  left_join( serology_norm_rm_empty_sinfo |> dplyr::select(sample_name, nucleocapsid.full, spike.wt), by = c("samplename" = "sample_name")) |>
+  mutate( nr_vacc_doses = case_when( is.na(nr_vacc_doses) ~ 0,
+                                     T ~nr_vacc_doses)) |>
+  #smoke_c19_3 = case_when( is.na(smoke_c19_3) ~ 0,
+  #                         T ~ smoke_c19_3)) |>
+  mutate( elution_date = as.Date("2022-09-30"),
+          sample_date = as.Date(sample_date),
+          storage_time = time_length(interval(sample_date, elution_date), "months"),
+          sample_date_nr = as.numeric(sample_date),
+          serocluster_numeric = as.numeric(cluster_maximum_6prot_omi),
+          sampling_phase_nr = case_when( sampling_phase == "Phase 1" ~ 1,
+                                         sampling_phase == "Phase 2" ~ 2,
+                                         sampling_phase == "Phase 3" ~ 3)) |>
+  left_join(olink_bamse_protpqn_blank_rm_intnorm_si |> dplyr::select( samplename, all_of(proteins_of_interest)), by = "samplename") |>
+  rowwise() %>% 
+  mutate(mean_npx = mean(c_across(all_of(proteins_of_interest)), na.rm = TRUE)) %>%
+  ungroup()
+
+
+clinical_vars <- c("sample_date_nr", "nr_vacc_doses", "sampling_phase_nr", "serocluster_numeric", "nucleocapsid.full", "spike.wt", "male", "BMI_c19", "qc19_3aldy", "storage_time", "mean_npx" )
+
+# For selected PCs (e.g., top 5), correlate each with clinical vars
+library(corrr)
+
+cor_results <- correlate(pc_scores[, c("PC1", "PC2", "PC3", clinical_vars, proteins_of_interest)], method = "spearman")
+
+cor_long <- cor_results %>%
+  pivot_longer(cols = -term, names_to = "PC", values_to = "correlation") %>%
+  filter(!term %in% c("PC1", "PC2", "PC3", "PC4", "PC5"))  # remove PC self-correlations
+
+cor_order <- cor_long |>
+  filter(PC == "PC1") |>
+  arrange(desc(correlation)) |>
+  dplyr::select(term, order_pc1 = correlation)
+
+
+## only clinical variables:
+cor_long |>
+  filter(PC %in% c("PC1", "PC2", "PC3")) |>
+  filter( term %in% clinical_vars) |>
+  #left_join(cor_order, by = "term") |>
+  #mutate(term = forcats::fct_reorder(term, order_pc1, .desc = TRUE)) |>
+  ggplot(aes(y = PC, x = term, fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", high = "red", mid = "white",
+    midpoint = 0, limit = c(-1, 1), space = "Lab",
+    name = "Spearman\nCorrelation"
+  ) +
+  geom_text(aes(label = round(correlation, 2)), size = 2) +
+  theme_minimal() +
+  labs(
+    y = "Principal Components", x = "Clinical variables",
+    title = "Correlation between PCA components and clinical variables"
+  ) +
+  #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  theme(
+    axis.text.x = element_text(
+      angle = 60,           # more angled labels
+      hjust = 1,            # right-align
+      size = 7              # smaller x-axis labels
+    ),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(size = 10)
+  )
+
+
+### Spearman correlations but getting p-values for correlations too:
+pcs <- c("PC1", "PC2", "PC3")
+vars <- c(clinical_vars, proteins_of_interest)
+
+
+cor_results_p <- expand_grid(
+  pc = pcs,
+  var = vars
+) %>%
+  mutate(
+    test = map2(pc, var, ~ {
+      x <- pc_scores[[.x]]
+      y <- pc_scores[[.y]]
+      if (sum(!is.na(x) & !is.na(y)) >= 3) {
+        cor.test(x, y, method = "spearman")
+      } else {
+        NA
+      }
+    }),
+    rho = map_dbl(test, ~ ifelse(is.list(.x), .x$estimate, NA_real_)),
+    p_value = map_dbl(test, ~ ifelse(is.list(.x), .x$p.value, NA_real_))
+  ) %>%
+  dplyr::select(-test) %>%
+  mutate(fdr = p.adjust(p_value, method = "fdr"))
+
+cor_long |> filter(PC == "PC1") |> filter(term %in% proteins_of_interest) |> ggplot( aes( x = correlation )) + geom_histogram( stat = "bin", color = "black", fill = "white") +
+  theme_classic() + 
+  labs( title = "Protein correlation to PC1", x = "Spearman's rho") +
+  scale_x_continuous(limits = c(-1, 1)) +
+  geom_vline( xintercept = 0, linetype = "dashed", color = "grey", linewidth = 1.2) +
+  geom_vline( xintercept = 0.5, linetype = "dotted", color = "orange", linewidth = 1.2) +
+  geom_vline( xintercept = -0.5, linetype = "dotted", color = "orange", linewidth = 1.2)
+
+```
+
+### Comparison of protein-trait associations in BAMSE and UK biobank (UKB) (Fig S8):
+
+```{r}
+
+source("bamse_vs_ukb.R")
+
+ukb1 <- read.csv("ukb1.csv") # table 5
+ukb2 <- read.csv("ukb2.csv") # table 7
+
+results_lm_p2_in <- read.csv("lm phase 2 against information_protpqn intesnity data_fdr across variable_250928.csv")
+
+## Adjust the names in ukb1 and ukb2 so that these are the same as in bamse file:
+ukb1$assay[grep("HLA-E", ukb1$assay)] <- "HLA.E"
+ukb2$assay[grep("HLA-E", ukb2$assay)] <- "HLA.E"
+
+ukb1$assay[grep("HLA-DRA", ukb1$assay)] <- "HLA.DRA"
+ukb2$assay[grep("HLA-DRA", ukb2$assay)] <- "HLA.DRA"
+
+ukb_vs_bamse_result <- bamse_vs_ukb(results_lm_p2_in, ukb1, ukb2)
+
+# Whick proteins are not present in both data sets?
+setdiff(results_lm_p2_in$protein, ukb1$assay)
+
+ukb_vs_bamse_result$plot
+
+write.csv(ukb_vs_bamse_result$df, "ukb vs bamse slopes results_p value_251001.csv")
+```
+
+### **Comparison of protein-trait associations in BAMSE and population survey. (Fig. S9):**
+
+```{r}
+
+### bamse_vs_vaccserol function:
+
+vaccserol_beta <- read_excel("table_S7_vaccserol.xlsx")
+
+## Adjust the names in ukb1 and ukb2 so that these are the same as in bamse file:
+ukb1$assay[grep("HLA-E", ukb1$assay)] <- "HLA.E"
+ukb2$assay[grep("HLA-E", ukb2$assay)] <- "HLA.E"
+
+ukb1$assay[grep("HLA-DRA", ukb1$assay)] <- "HLA.DRA"
+ukb2$assay[grep("HLA-DRA", ukb2$assay)] <- "HLA.DRA"
+
+vaccserol_vs_bamse_result <- bamse_vs_vaccserol(results_lm_p2_in, vaccserol_beta)
+
+vaccserol_vs_bamse_result$plot + labs( x = "Beta from vaccination serology", y = "Beta form BAMSE")
+
+write.csv(vaccserol_vs_bamse_result$df, "vaccination serology vs bamse slopes results_p value_251024.csv")
+```
+
+### Changes of protein levels in relation to storage time (Fig. S10):
+
+```{r}
+## LMM against storage time, adjust for sex and do this only for the serocluster 1 samples
+
+## Take out the serocluster 1 samples that remain in serocluster 1 all phases:
+serocluster1_3p <- serology_norm_rm_empty_sinfo |>
+  group_by(idnr) |>
+  filter(all( cluster_maximum_6prot_omi == 1)) |>
+  pull(sample_name)
+
+#library(lme4)
+library(lmerTest)
+# Initialize an empty data frame to store the results
+lm_results_storagetime <- data.frame(protein = character(),
+                                     slope = numeric(),
+                                     p_value = numeric(),
+                                     stringsAsFactors = FALSE)
+
+olink_proteins <- olink_proteins_oi
+
+
+plot_list <- list()
+# Loop over each protein
+for (protein in olink_proteins) {
+  
+  # Perform the data selection and linear modeling
+  data <- olink_bamse_protpqn_blank_rm_intnorm |>
+    dplyr::rename(sampleid = sample_id) |> 
+    # select(!sample_id) |>
+    left_join(samp_info_key, by = "sampleid") |>
+    left_join(sample_info, by = c("samplename" = "sample_name")) |>
+    mutate(elution_date = as.Date("2022-09-30"),
+           sampling_time = as.Date(sampling_time),
+           storage_time = time_length(interval(sampling_time, elution_date), "months"),
+           sampling_phase = plot_variable) |>
+    left_join( sample_info_wide |> dplyr::select(idnr, male), by = "idnr") |>
+    mutate(sex = case_when( male == 0 ~ "female",
+                            male == 1 ~ "male")) |>
+    filter( samplename %in% serocluster1_3p)
+  #filter(!is.na(idnr))
+  
+  
+  # Fit a linear mixed model
+  lmer_fit <- lmerTest::lmer(data[[protein]] ~ storage_time + (1 | idnr) + sex, data = data)
+  
+  # Extract fixed effects
+  lmer_summary <- summary(lmer_fit)$coefficients
+  
+  # Extract slope and p-value for storage_timeserocluster
+  slope <- lmer_summary["storage_time", "Estimate"]
+  p_value <- lmer_summary["storage_time", "Pr(>|t|)"]
+  
+  # Store the results
+  lm_results_storagetime <- rbind(lm_results_storagetime, data.frame(protein = protein,
+                                                                     slope = slope,
+                                                                     p_value = p_value,
+                                                                     stringsAsFactors = FALSE))
+
+  
+}
+
+
+lm_results_storagetime$fdr_value <- p.adjust( lm_results_storagetime$p_value , method = "fdr")
+lm_results_storagetime$bonferroni <- p.adjust( lm_results_storagetime$p_value , method = "bonferroni")
+
+lm_results_storagetime <- lm_results_storagetime |>
+  mutate( fdr_color = case_when( fdr_value < 0.01 &  slope < 0 ~ "sig.down",
+                                 fdr_value < 0.01 &  slope > 0 ~ "sig.up",
+                                 T ~ "not sig")) |>
+  mutate( bonferroni_color = case_when( bonferroni < 0.01 &  slope < 0 ~ "sig.down",
+                                        bonferroni < 0.01 &  slope > 0 ~ "sig.up",
+                                        T ~ "not sig")) 
+
+# Select the top 10 rows with the lowest bonferroni values
+top10_proteins <- lm_results_storagetime %>%
+  arrange(bonferroni) %>%
+  head(10)
+
+up_proteins <- lm_results_storagetime |>
+  filter(bonferroni_color == "sig.up")
+
+library(ggrepel)
+
+label_proteins <- rbind(top10_proteins, up_proteins)
+
+ggplot(lm_results_storagetime, aes( x = slope, y = -log10(bonferroni))) +
+  geom_point( aes(col = bonferroni_color ), size = 3) +
+  geom_hline(yintercept = -log10(0.01), linetype="dashed", 
+             color = "black", size = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", 
+             color = "black", size = 1) +
+  scale_color_manual( values = c("grey", "#A6CEE3" , "#1F78B4")) +
+  xlim(-0.14, 0.14) +
+  labs( title = "Slopes for Protein signal vs storage time (months)", subtitle = "LMM + Bonferroni adjusted p-value") +
+  theme_classic(10) +
+  geom_text_repel(data = label_proteins, 
+                  aes(label = protein), 
+                  max.overlaps = Inf, # Ensures all labels are shown
+                  box.padding = 0.5, 
+                  point.padding = 0.3, 
+                  segment.color = "grey50") 
+
+# Count how many bonferroni values are below 0.01
+count_below_0_01 <- lm_results %>%
+  filter(bonferroni < 0.01) %>%
+  tally()
+
+unstable_proteins <- lm_results_storagetime %>%
+  filter(bonferroni < 0.01) |> pull(protein)
+
+# Get the top 10 proteins with the lowest bonferroni values
+top_10_proteins <- lm_results %>%
+  arrange(bonferroni) %>%  # Sort by bonferroni in ascending order
+  slice_head(n = 10) %>%   # Select the top 10 rows
+  select(protein, bonferroni)  # Select only the protein and bonferroni columns
+
+## Plot distribution plot of the slopes:
+plot1 <- ggplot(lm_results_storagetime, aes( x = slope, fill = bonferroni_color )) +
+  geom_histogram(  col = "black", alpha = 0.8) +
+  theme_classic(10) +
+  geom_vline(aes(xintercept= 0 ),
+             color="black", linetype="dashed", size=1) + 
+  labs( title = "Distribution of slopes for Protein signal vs storage time (months)", subtitle = "Slopes from LMM") +
+  scale_fill_manual( values = c("grey", "#A6CEE3" , "#1F78B4")) +
+  theme_classic(10)
+
+###                   Fig S10 c:
+hpa_file <- read.delim("./datafiles/proteinatlas.tsv")
+
+hpa_stor_df <- storage_time_effect %>%
+  mutate(sig_storage = case_when( bonferroni < 0.01 ~ "sig",
+                                  T ~ "not sig")) |>
+  left_join(olink_uniprot, by = c("protein" = "Assay"))
+
+hpa_stor_df$UniProt[grep("HLA.E", hpa_stor_df$protein)] <- "P13747"
+hpa_stor_df$UniProt[grep("HLA.DRA", hpa_stor_df$protein)] <- "P01903"
+hpa_stor_df$UniProt[grep("SIT1", hpa_stor_df$protein)] <- "Q9Y3P8"
+
+
+hpa_file$Uniprot[grep("RABGAP1L", hpa_file$Gene)] <- "Q5R372"
+hpa_file$Uniprot[grep("PNLIPRP2", hpa_file$Gene)] <- "P54317"
+hpa_file$Uniprot[grep("SIRPB1", hpa_file$Gene)] <- "O00241"
+hpa_file$Uniprot[grep("CDSN", hpa_file$Gene)] <- "Q15517"
+hpa_file$Uniprot[grep("TGFB1", hpa_file$Gene)] <- "P01137"
+
+hpa_stor_df <- hpa_stor_df |>
+  left_join(hpa_file , by = c("UniProt" = "Uniprot" ))
+
+hpa_stor_df_v2 <- hpa_stor_df %>%
+  mutate(
+    Predicted_secreted = str_detect(
+      Protein.class %||% "",
+      regex("Predicted secreted proteins", ignore_case = TRUE)
+    ),
+    Predicted_intracellular = str_detect(
+      Protein.class %||% "",
+      regex("Predicted intracellular proteins", ignore_case = TRUE)
+    ),
+    Predicted_membrane = str_detect(
+      Protein.class %||% "",
+      regex("Predicted membrane proteins", ignore_case = TRUE)
+    ),
+    
+    # Combination category
+    class_combo = case_when(
+      Predicted_secreted & Predicted_intracellular ~ "Secreted + Intracellular",
+      Predicted_secreted & Predicted_membrane ~ "Secreted + Membrane",
+      Predicted_intracellular & Predicted_membrane ~ "Intracellular + Membrane",
+      Predicted_secreted &  Predicted_membrane & Predicted_intracellular ~ "Secreted + Membrane + Intracellular",
+      Predicted_secreted ~ "Secreted only",
+      Predicted_intracellular ~ "Intracellular only",
+      Predicted_membrane ~ "Membrane only",
+      TRUE ~ "Other / none"
+    )
+  )
+
+
+source("comp_groups.R")
+
+plot1 <- comp_groups( hpa_stor_df_v2$class_combo, hpa_stor_df$sig_storage,  p_adj_method = "fdr", p_stars = TRUE, x_name = "Protein class", g_name = "Significant storage effect" )
+
+plot1$plt
+```
+
+### **Spearman and intraclass correlation across repeated samplings** (Fig. S17):
+
+**Calculate Inter-class correlations. ICC \> 0.8 are considered as stable:**
+
+The Intraclass correlation is used as a measure of association when studying the reliability of raters.
+
+ICC (close to 1) indicates high similarity between rater's scores.
+
+ICC (close to 0) indicates rater's scores are not similar.
+
+Usage:
+
+```         
+ICC(x,missing=TRUE,alpha=.05,lmer=TRUE,check.keys=FALSE)
+```
+
+```{r}
+library(psych)
+
+#------------------------------ Correlation and ICC per protein:
+#Spearman correlation:
+corr_matrix_list <- lapply(olink_proteins_oi, function(protein) {
+  
+  
+  # Extract data for the given protein
+  protein_data <-  olink_bamse_protpqn_blank_rm_intnorm_si |>
+    #select(samplename, idnr, sampling_phase, cluster_maximum_6prot_omi, !!sym(protein))
+  select(samplename, idnr, sampling_phase, !!sym(protein))
+  
+  # Split data by phase
+  phase1 <- protein_data %>% filter(sampling_phase == "Phase 1")
+  phase2 <- protein_data %>% filter(sampling_phase == "Phase 2")
+  phase3 <- protein_data %>% filter(sampling_phase == "Phase 3")
+  
+  # Merge phase data on sample names
+  phase1_vs_phase2 <- merge(phase1, phase2, by = "idnr", suffixes = c("_P1", "_P2"))
+  phase2_vs_phase3 <- merge(phase2, phase3, by = "idnr", suffixes = c("_P2", "_P3"))
+  phase1_vs_phase3 <- merge(phase1, phase3, by = "idnr", suffixes = c("_P1", "_P3")) 
+  
+  # Calculate Spearman's rho for Phase 1 vs Phase 2
+  rho_phase1_vs_phase2 <- cor(phase1_vs_phase2[[paste0(protein, "_P1")]], 
+                              phase1_vs_phase2[[paste0(protein, "_P2")]], 
+                              method = "spearman", 
+                              use = "complete.obs")
+  
+  
+  # Calculate Spearman's rho for Phase 2 vs Phase 3
+  rho_phase2_vs_phase3 <- cor(phase2_vs_phase3[[paste0(protein, "_P2")]], 
+                              phase2_vs_phase3[[paste0(protein, "_P3")]], 
+                              method = "spearman", 
+                              use = "complete.obs")
+  
+  rho_phase1_vs_phase3 <- cor(phase1_vs_phase3[[paste0(protein, "_P1")]], 
+                              phase1_vs_phase3[[paste0(protein, "_P3")]], 
+                              method = "spearman", 
+                              use = "complete.obs")
+  
+  
+  # Return the correlation values
+  return(c(IDnr = protein, corr_v1v2 = rho_phase1_vs_phase2, corr_v2v3 = rho_phase2_vs_phase3, corr_v1v3 = rho_phase1_vs_phase3))
+  
+})
+
+
+# Convert list to data frame
+corr_matrix_list_df <- do.call(rbind, corr_matrix_list)
+
+colnames(corr_matrix_list_df) <- c("protein", "phase1_vs_phase2", "phase2_vs_phase3", "phase1_vs_phase3" )
+
+corr_matrix_list_df <- as.data.frame(corr_matrix_list_df)
+corr_matrix_list_df[,2:4] <- apply(corr_matrix_list_df[,2:4], 2, as.numeric)
+
+corr_plot_protein_intnorm <- corr_matrix_list_df |>
+  pivot_longer( cols = contains("phase" ), names_to = "Comparison", values_to = "spearman" ) |>
+  ggplot( aes( x = spearman, col = Comparison, fill = Comparison)) +
+  geom_density( alpha = 0.5) +
+  theme_classic(11) +
+  scale_fill_brewer( palette = "Pastel2") +
+  scale_color_brewer( palette = "Pastel2") +
+  labs(title = "Protein correlation", x = "Spearman's Rho") +
+  theme( # remove the vertical grid lines
+    panel.grid.major.y = element_blank() ,
+    # explicitly set the horizontal lines (or they will disappear too)
+    panel.grid.major.x = element_line( size=.1, color="black", linetype = "dotted" ) 
+  ) +
+  xlim(-1, 1)
+
+##                      ICC (Supp Fig S17b)
+icc_matrix_list <- lapply(olink_proteins_oi, function(protein) {
+  
+  
+  # Extract data for the given protein
+  protein_data <- olink_bamse_protpqn_blank_rm_intnorm_si |>
+    dplyr::select(samplename, idnr, sampling_phase, !!sym(protein))
+  
+  # Split data by phase
+  phase1 <- protein_data %>% filter(sampling_phase == "Phase 1")
+  phase2 <- protein_data %>% filter(sampling_phase == "Phase 2")
+  phase3 <- protein_data %>% filter(sampling_phase == "Phase 3")
+  
+  # Merge phase data on sample names
+  phase1_vs_phase2 <- merge(phase1, phase2, by = "idnr", suffixes = c("_P1", "_P2"))
+  
+  phase2_vs_phase3 <- merge(phase2, phase3, by = "idnr", suffixes = c("_P2", "_P3"))
+  
+  phase1_vs_phase3 <- merge(phase1, phase3, by = "idnr", suffixes = c("_P1", "_P3"))
+  
+  # Calculate ICC for Phase 1 vs Phase 2
+  icc_model <-  psych::ICC(cbind(phase1_vs_phase2[[paste0(protein, "_P1")]],
+                                 phase1_vs_phase2[[paste0(protein, "_P2")]]), alpha = 0.05, lmer = TRUE, check.keys = TRUE)
+  
+  icc3_v12 <- icc_model$results$ICC[3]
+  
+  # Calculate ICC for Phase 2 vs Phase 3
+  icc_model <-  psych::ICC(cbind(phase2_vs_phase3[[paste0(protein, "_P2")]],
+                                 phase2_vs_phase3[[paste0(protein, "_P3")]]), alpha = 0.05, lmer = TRUE, check.keys = TRUE)
+  
+  icc3_v23 <- icc_model$results$ICC[3]
+  
+  # Calculate ICC for Phase 1 vs Phase 3
+  icc_model <-  psych::ICC(cbind(phase1_vs_phase3[[paste0(protein, "_P1")]],
+                                 phase1_vs_phase3[[paste0(protein, "_P3")]]), alpha = 0.05, lmer = TRUE, check.keys = TRUE)
+  
+  icc3_v13 <- icc_model$results$ICC[3]
+  
+  
+  # Return the correlation values
+  return(c(protname = protein, corr_v1v2 = icc3_v12, corr_v2v3 = icc3_v23, corr_v1v3 =  icc3_v13 ))
+  # wrap_plots(plot1 + plot2 + plot_layout(guides = "collect"))
+  
+})
+
+
+# Convert list to data frame
+icc_matrix_list_df <- do.call(rbind, icc_matrix_list)
+
+colnames(icc_matrix_list_df) <- c("protein", "phase1_vs_phase2", "phase2_vs_phase3", "phase1_vs_phase3" )
+
+icc_matrix_list_df <- as.data.frame(icc_matrix_list_df)
+
+icc_matrix_list_df[,2:4] <- apply(icc_matrix_list_df[,2:4], 2, as.numeric)
+
+icc_plot_protein_intnorm <- icc_matrix_list_df |>
+  pivot_longer( cols = contains("phase" ), names_to = "Comparison", values_to = "icc3" ) |>
+  ggplot( aes( x = icc3, col = Comparison, fill = Comparison)) +
+  geom_density( alpha = 0.5) +
+  theme_classic(11) +
+  scale_fill_brewer( palette = "Pastel2") +
+  scale_color_brewer( palette = "Pastel2") +
+  labs(title = "Protein intraclass correlation (ICC3)", x = "Intraclass correlation") +
+  xlim(-1, 1) +
+  theme( # remove the vertical grid lines
+    panel.grid.major.y = element_blank() ,
+    # explicitly set the horizontal lines (or they will disappear too)
+    panel.grid.major.x = element_line( size=.1, color="black", linetype = "dotted" ) 
+  ) +
+  xlim(-1, 1)
+
+#                                Plot the proteins that have the highest and lowest ICC:
+colnames(icc_matrix_list_df) <- c("protein", "icc_v1v2", "icc_v2v3", "icc_v1v3" )
+
+
+# Top 5 highest and lowest for icc_v1v2
+top_5_high_icc_v1v2 <- icc_matrix_list_df %>%
+  arrange(desc(icc_v1v2)) %>%
+  head(5)
+
+top_5_low_icc_v1v2 <- icc_matrix_list_df %>%
+  arrange(icc_v1v2) %>%
+  head(5)
+
+# Top 5 highest and lowest for icc_v2v3
+top_5_high_icc_v2v3 <- icc_matrix_list_df %>%
+  arrange(desc(icc_v2v3)) %>%
+  head(5)
+
+top_5_low_icc_v2v3 <- icc_matrix_list_df %>%
+  arrange(icc_v2v3) %>%
+  head(5)
+
+# Combine all results into a list
+top_5_summary <- list(
+  top_5_high_icc_v1v2 = top_5_high_icc_v1v2,
+  top_5_low_icc_v1v2 = top_5_low_icc_v1v2,
+  top_5_high_icc_v2v3 = top_5_high_icc_v2v3,
+  top_5_low_icc_v2v3 = top_5_low_icc_v2v3
+)
+
+# Combine them into a single data frame:
+top_5_summary_df <- bind_rows(
+  top_5_high_icc_v1v2 %>% mutate(category = "top_5_high_icc_v1v2"),
+  top_5_low_icc_v1v2 %>% mutate(category = "top_5_low_icc_v1v2"),
+  top_5_high_icc_v2v3 %>% mutate(category = "top_5_high_icc_v2v3"),
+  top_5_low_icc_v2v3 %>% mutate(category = "top_5_low_icc_v2v3")
+)
+
+top_and_bottom <- unique(top_5_summary_df$protein)
+
+plot_list <- lapply(top_and_bottom, function(protein) {
+  
+  ggplot_data <- olink_bamse_protpqn_blank_rm_intnorm_si %>%
+    select(!!sym(protein), sampling_phase, samplename, sample_date, idnr_pad)
+  
+  print(paste0("protein: " , protein, "n samples: " , nrow(ggplot_data), "n subjects", ggplot_data |> pull(idnr_pad) |> unique() |> length()))
+  
+  category <- top_5_summary_df[grep(protein, top_5_summary_df$protein), "category"]
+  ggplot_data$category <- category
+  
+  p <- ggplot(ggplot_data, aes(x = sampling_phase, y = !!sym(protein), color = category)) +
+    geom_point( size = 0.7) +
+    geom_line(aes(group = idnr_pad), alpha = 0.15) +
+    theme_classic(10) +
+    labs(title = paste0(protein), y = "ProtPQN NPX [AU]", x = "") +
+    scale_color_manual(
+      values = c(
+        "top_5_high_icc_v1v2" = "skyblue2",
+        "top_5_high_icc_v2v3" = "skyblue2",
+        "top_5_low_icc_v1v2" = "sienna2",
+        "top_5_low_icc_v2v3" = "sienna2"
+      )
+    ) +
+    guides( color = "none")
+  
+  return(p)
+})
+
+
+###---------------------------- Correlate samples from same subjects:
+
+# Compare random vs same subject correlation
+set.seed(123)  # Ensure reproducibility
+
+big_df <- olink_bamse_protpqn_blank_rm_intnorm_si
+
+# Randomly select 100 unique idnr values
+random_idnrs <- big_df |> distinct(idnr) |> sample_n(807)
+
+# Filter dataset to only keep selected samples (one per idnr)
+small_df <- big_df |> filter(idnr %in% random_idnrs$idnr) |> column_to_rownames(var = "samplename") |> select(all_of(olink_proteins_oi)) |> as.matrix()
+
+# Data for correlation and plotting
+# Correlation matrix between phases
+cor_mat <- cor(t(small_df), method = "spearman")
+
+# Keep only the upper triangle (since the correlation matrix is symmetric and diagonal contains 1s)
+cor_mat[lower.tri(cor_mat, diag = T)] <- NA
+# Convert to longer format, filter out NAs
+cor_mat <- as.data.frame(cor_mat) %>% rownames_to_column("sample1") %>%
+  pivot_longer(cols = -sample1, names_to = "sample2", values_to = "corr") %>%
+  filter(!is.na(corr))
+
+cor_mat <- cor_mat |>
+  mutate(
+    num1 = sub("^[A-Z]\\d_", "", sample1),  # Extract number from sample1
+    num2 = sub("^[A-Z]\\d_", "", sample2),  # Extract number from sample2
+    same_subject = ifelse(num1 == num2, "Same subject", "Different subject")  # Check if they match
+  )
+
+# Plot density of correlations
+p1 <- ggplot(cor_mat, aes(x = corr, fill = same_subject, color = same_subject)) +
+  geom_density(alpha = 0.4) +
+  theme_classic() +
+  #scale_fill_manual( values = c("#A6CEE3", "#1F78B4" )) + 
+  #scale_color_manual( values = c("#A6CEE3", "#1F78B4" )) + 
+  scale_fill_brewer( palette = "Pastel2") +
+  scale_color_brewer( palette = "Pastel2", ) +
+  labs(title = "Sample correlations", x = "Spearman's Rho") +
+  theme( # remove the vertical grid lines
+    panel.grid.major.y = element_blank() ,
+    # explicitly set the horizontal lines (or they will disappear too)
+    panel.grid.major.x = element_line( size=.1, color="black", linetype = "dotted" ) 
+  ) +
+  xlim(-1, 1)
+
+##### Compare correlation for subjects who change serocluster vs the ones who remain in cluster 1
+bamse_subject <- unique(olink_bamse_protpqn_blank_rm_intnorm_si$idnr)
+
+corr_matrix_list <- lapply(bamse_subject, function(subject) {
+  
+  both <- olink_bamse_protpqn_blank_rm_intnorm_si |>
+    filter( idnr == subject ) |>
+    select( -platepos) |>
+    pivot_longer(cols = matches(olink_proteins_oi), names_to = "assay", values_to = "npx")
+  
+  #phases_for_samp <- unique(both$sampling_phase)
+  phases_for_samp <- unique(both$sampling_phase)
+  if( "Phase 1" %in%  phases_for_samp && "Phase 2" %in% phases_for_samp) {
+    phase1_data <- both %>%
+      filter(sampling_phase == "Phase 1") %>%
+      select(idnr, assay, npx) %>%
+      rename(npx_phase1 = npx)
+    
+    phase2_data <- both %>%
+      filter(sampling_phase == "Phase 2") %>%
+      select(idnr, assay, npx) %>%
+      rename(npx_phase2 = npx)
+    
+    combined <- phase1_data %>%
+      inner_join(phase2_data, by = c("idnr", "assay"))
+    
+    print(subject)
+    corr_value_v12 <- cor(combined$npx_phase1, combined$npx_phase2, method = "spearman", use = "pairwise.complete.obs")
+    
+  } else {
+    # plot1 <- ggplot( x = 1, y = 2) + geom_point()
+    
+    corr_value_v12 <- NA
+  }
+  
+  if( "Phase 2" %in%  phases_for_samp && "Phase 3" %in% phases_for_samp) {
+    phase2_data <- both %>%
+      filter(sampling_phase == "Phase 2") %>%
+      select(idnr, assay, npx) %>%
+      rename(npx_phase2 = npx)
+    
+    phase3_data <- both %>%
+      filter(sampling_phase == "Phase 3") %>%
+      select(idnr, assay, npx) %>%
+      rename(npx_phase3 = npx)
+    
+    
+    combined <- phase2_data %>%
+      inner_join(phase3_data, by = c("idnr", "assay"))
+    
+    print(subject)
+    corr_value_v23 <- cor(combined$npx_phase2, combined$npx_phase3, method = "spearman", use = "pairwise.complete.obs")
+    
+  } else {
+    # plot2 <- ggplot( x = 1, y = 2) + geom_point()
+    corr_value_v23 <- NA
+  }
+  
+  
+  if( "Phase 1" %in%  phases_for_samp && "Phase 3" %in% phases_for_samp) {
+    phase1_data <- both %>%
+      filter(sampling_phase == "Phase 1") %>%
+      select(idnr, assay, npx) %>%
+      rename(npx_phase1 = npx)
+    
+    phase3_data <- both %>%
+      filter(sampling_phase == "Phase 3") %>%
+      select(idnr, assay, npx) %>%
+      rename(npx_phase3 = npx)
+    
+    
+    combined <- phase1_data %>%
+      inner_join(phase3_data, by = c("idnr", "assay"))
+    
+    print(subject)
+    corr_value_v13 <- cor(combined$npx_phase1, combined$npx_phase3, method = "spearman", use = "pairwise.complete.obs")
+    
+  } else {
+    corr_value_v13 <- NA
+  }
+  
+  
+  corr_matrix <-  c(subject, corr_value_v12, corr_value_v23, corr_value_v13)
+  
+  corr_matrix
+  
+})
+
+
+# Convert list to data frame
+corr_matrix_list_df <- do.call(rbind, corr_matrix_list)
+
+colnames(corr_matrix_list_df) <- c("idnr", "phase1_vs_phase2", "phase2_vs_phase3", "phase1_vs_phase3" )
+
+corr_matrix_list_df <- as.data.frame(corr_matrix_list_df)
+
+
+## Mark the ones that are from supernegative subjects:
+serocluster1_3p_idnr <- serology_norm_rm_empty_sinfo |>
+  group_by(idnr) |>
+  filter(all( cluster_maximum_6prot_omi == 1)) |>
+  pull(idnr)
+
+corr_plot_sample_intnorm_dual <- corr_matrix_list_df |>
+  pivot_longer( cols = contains("phase" ), names_to = "Comparison", values_to = "spearman" ) |>
+  mutate( superneg = case_when( idnr %in% serocluster1_3p_idnr ~ "Cluster 1 in all phases",
+                                T ~ "Changing cluster")) |>
+  ggplot( aes( x = spearman, col = Comparison, fill = Comparison)) +
+  geom_density( alpha = 0.3) +
+  theme_classic(11) +
+  scale_fill_brewer( palette = "Pastel2") +
+  scale_color_brewer( palette = "Pastel2") +
+  labs(title = "Sample correlation", x = "Spearman's Rho") +
+  theme( # remove the vertical grid lines
+    panel.grid.major.y = element_blank() ,
+    # explicitly set the horizontal lines (or they will disappear too)
+    panel.grid.major.x = element_line( size=.1, color="black", linetype = "dotted" ) 
+  ) +
+  xlim(-1, 1) +
+  facet_wrap( ~ superneg,  ncol=1)
+
+
+#plot <- ggplot()
+#plot_build <- ggplot_build(plot)
+#plot_build@data
+
+```
+
+## Comparing protein levels in different cluster groups using linear models:
+
+Preparing data frame:
+
+```{r}
+##--------------------------------------------------------------------------------------------------------
+####                                  Preparing the data frames:
+##--------------------------------------------------------------------------------------------------------
+
+bamse_for_lm <- olink_bamse_protpqn_blank_rm_intnorm_si %>%
+  filter(length(idnr) > 1, .by = idnr) %>%
+  mutate(clust_traj12 = paste0(cluster_maximum_6prot_omi[sampling_phase == "Phase 1"],
+                               cluster_maximum_6prot_omi[sampling_phase == "Phase 2"]),
+         clust_traj23 = paste0(cluster_maximum_6prot_omi[sampling_phase == "Phase 2"],
+                               cluster_maximum_6prot_omi[sampling_phase == "Phase 3"]),
+         .by = idnr) %>%
+  left_join(olink_bamse_protpqn_blank_rm_intnorm_si_ex %>% dplyr::select(sample_id, male), by = "sample_id")
+
+phase_count12 <- bamse_for_lm %>% distinct(idnr, clust_traj12) %>%
+  count(clust_traj12)
+phase_count23 <- bamse_for_lm %>% distinct(idnr, clust_traj23) %>%
+  count(clust_traj23)
+
+olink_bamse_protpqn_blank_rm_intnorm_si_long <- olink_bamse_protpqn_blank_rm_intnorm_si |>
+  pivot_longer(
+    cols = all_of(proteins_of_interest),   # Exclude the first column (sample_name)
+    names_to = "assay",  # Create a 'protein' column with the protein names
+    values_to = "npx"    # Create a 'value' column with the corresponding TRUE/FALSE values
+  ) 
+
+### Adjust data for storage time:
+time_adjusted_data <- olink_bamse_protpqn_blank_rm_intnorm_si_long |> 
+  select(sampling_time, assay, npx, idnr, samplename) |> 
+  mutate(elution_date = as.Date("2022-09-30"),
+         sampling_time = as.Date(sampling_time),
+         storage_time = time_length(interval(sampling_time, elution_date), "months")) |> 
+  # filter( assay %in% c("PAPPA", "MVK", "PARP1")) |>
+  filter(!assay %in% c("DNPH1", "GLOD4", "PKLR")) |> 
+  group_by(assay) |> nest() |>
+  mutate(adj_data = map(data, \(x) {
+    lmer_result <- resid(lmer(npx ~ storage_time + (1|idnr), data = x[complete.cases(x), ]))
+    data.frame(samplename = x$samplename, npx = lmer_result)
+  })) |> 
+  select(-data) |>
+  unnest(adj_data) |> 
+  pivot_wider(id_cols = samplename, names_from = assay, values_from = npx) |> 
+  left_join(olink_bamse_protpqn_blank_rm_intnorm_si |> 
+              select(samplename , cluster_maximum_6prot_omi),
+            by = "samplename")
+
+
+time_adjusted_data_for_lm <- time_adjusted_data |>
+  left_join( bamse_for_lm |> dplyr::select(samplename, sample_id, sampling_phase, idnr, male, clust_traj12, clust_traj23  ), by = "samplename")
+
+
+## Olink proteins in time adjusted data:
+olink_proteins_ta <- olink_proteins[-grep("PKLR|GLOD4|DNPH1", olink_proteins)]
+
+```
+
+Function for lm analysis comparing the change in protein levels between different groups:
+
+```{r}
+#### Function for performing the lm analysis:
+library(ggh4x)
+library(ggrepel)
+
+# linear analysis with possibility to do delta delta
+lm_analysis <- function(data_in, sample_id = "sampleid", predictor, covar = NULL, stratify_by = NULL,
+                        difference_col = NULL, individual_id = NULL, differences_between = NULL) {
+  # data_in, list containing data frames with the protein measurements in wide format (named `values`) and sample information in wide format (named `sinfo`). A common sample identifier should exist in both
+  # predictor, name of column that should be the main predictor. Must exist in `sinfo` in `data_in` and be numeric.
+  # sample_id, name of column in both `values` and `sinfo` that matches the rows of the two data frames
+  # covar, vector of column names in `sinfo` that should be included as covariates.
+  # stratify_by, name of column to stratify the analysis by (default is NULL, no stratification)
+  # difference_col, if differences should be used as the outcome, the name of the column containing the values to calculate difference between. E.g. if two samples come from the same individual at two time points, `difference_col` may be a time point column. Default is NULL (no difference calculation)
+  # individual_id, name of column containing individual identifiers. The differences in `difference_col` will be calculated per `individual_id`. Default is NULL (no difference calculation)
+  # differences_between, vector of two values existing in `difference_col` to calculate the difference in protein levels between. Default is NULL (no difference calculation)
+  
+  diff_null <- c(is.null(difference_col), is.null(individual_id), is.null(differences_between))
+  if (!sum(diff_null) %in% c(0, 3)) {
+    stop("'difference_col', 'individual_id', and 'differences_between' all need to be specified or all NULL.")
+  }
+  
+  # Make formula for linear model
+  lm_formula <- paste0("value ~ ", predictor,
+                       # Add covariates
+                       ifelse(!is.null(covar), " + ", ""),
+                       paste0(covar, collapse = " + "))
+  
+  lm_analysis <- data_in$values %>%
+    # Add sample info (columns with covariates, stratification variable, difference variable, IDs)
+    left_join(data_in$sinfo %>%
+                dplyr::select(all_of(c(sample_id, predictor, covar, difference_col, stratify_by, individual_id))),
+              by = sample_id) %>%
+    (\(x) {
+      if (!is.null(individual_id)) {filter(x, !is.na(get(individual_id)))} else {x}
+    })() %>%
+    # Convert for long format for analysis
+    pivot_longer(cols = -all_of(c(sample_id, predictor, covar, difference_col, stratify_by, individual_id)),
+                 names_to = "assay", values_to = "value") %>%
+    # Calculate difference in values if columns are provided
+    (\(x) {
+      if (!is.null(difference_col)) {
+        # Perform calculation per individual (individual_id) and protein (assay)
+        x %>% group_by(across(all_of(individual_id)), assay) %>%
+          # Calculate difference between second and first value of differences_between
+          mutate(value = value[get(difference_col) == differences_between[2]] -
+                   value[get(difference_col) == differences_between[1]]) %>%
+          ungroup() %>%
+          # Keep only unique differences for each individual (previous step keeps all rows, leaving repeat values)
+          distinct(across(all_of(c(individual_id, "assay"))), .keep_all = T)
+      }
+      else {x}
+    }) %>%
+    # Perform analysis per protein and stratification group
+    group_by(across(all_of(c("assay", stratify_by)))) %>% nest() %>%
+    mutate(median_diff = map(data, \(x) median(x$value[x[[predictor]] == sort(unique(x[[predictor]]))[[2]]]) -
+                               median(x$value[x[[predictor]] == sort(unique(x[[predictor]]))[[1]]])),
+           median_grp1 = map(data, \(x) median(x$value[x[[predictor]] == sort(unique(x[[predictor]]))[[1]]])),
+           median_grp2 = map(data, \(x) median(x$value[x[[predictor]] == sort(unique(x[[predictor]]))[[2]]])),
+           lm_res = map(data, \(x) lm(formula = lm_formula, data = x) %>% summary())) %>%
+    mutate(# Pick out beta and p-value
+      estimate = map(lm_res, \(x) x$coefficients %>% as.data.frame() %>%
+                       rownames_to_column("rn") %>% filter(str_detect(rn, predictor)) %>%
+                       pull(Estimate)),
+      p_value = map(lm_res, \(x) x$coefficients%>% as.data.frame() %>%
+                      rownames_to_column("rn") %>% filter(str_detect(rn, predictor)) %>%
+                      pull(`Pr(>|t|)`))) %>%
+    ungroup() %>%
+    dplyr::select(assay, !!stratify_by, median_diff, median_grp1, median_grp2, estimate, p_value) %>%
+    unnest(c(median_diff, median_grp1, median_grp2, estimate, p_value)) %>%
+    # Calculate FDR
+    mutate(fdr = p.adjust(p_value, method = "fdr"), .by = !!stratify_by)
+  
+  grp1 <- sort(unique(data_in$sinfo[[predictor]]))[[1]]
+  grp2 <- sort(unique(data_in$sinfo[[predictor]]))[[2]]
+  
+  return(list(results = lm_analysis, formula = lm_formula, predictor = predictor,
+              covariates = covar, computed_differences = ifelse(is.null(difference_col), F, T),
+              difference_params = list(difference_column = difference_col,
+                                       differences_between = differences_between,
+                                       individual_id = individual_id),
+              stratify_by = stratify_by,
+              groups = c(grp1, grp2)))
+}
+
+# plotting in volcano and mirrored manhattan plot
+plot_lm_results <- function(results, colr_by = NA, colr_scale = NULL, sep_by_colr = T,
+                            ns_grey = T, signif_threshold = 0.05) {
+  
+  # Stratified analysis
+  strat_log <- !is.null(results$stratify_by)
+  strat_name <- results$stratify_by
+  
+  # Make custom colour scale if non-significant values should be coloured differently
+  if (is.null(colr_scale)) {
+    if (!all(is.na(colr_by))) {
+      # Values to colour by are provided
+      
+      if (ns_grey) {
+        # Introduce a grey "not significant" category
+        colr_scale <- scale_colour_manual(
+          values = c(brewer.pal(length(unique(colr_by)), "Pastel1"), "grey90") %>%
+            setNames(c(as.character(sort(unique(colr_by))), "ns"))
+        )
+      } else {
+        colr_scale <- scale_colour_brewer(palette = "Pastel1")
+      }
+    } else {
+      # No values to colour by are provided
+      
+      if (ns_grey) {
+        # Significant points black, non-significant points grey
+        colr_scale <- scale_colour_manual(values = c("Significant" = "black", "ns" = "grey90"))
+      }
+    }
+  }
+  
+  plt_dat <- results$results %>%
+    # Add colouring categories
+    (\(x) {
+      if (!all(is.na(colr_by))) mutate(x, colr = colr_by)
+      else mutate(x, colr = case_when(fdr < signif_threshold ~ "Significant", T ~ "ns"))
+    }) %>%
+    # Prepare for stratified data
+    (\(x) {
+      if (strat_log) mutate(x, assay = paste0(assay, "_", get(strat_name)))
+      else x
+    })()
+  
+  if (!all(is.na(colr_by))) {
+    # Order proteins by colour
+    plt_dat <- arrange(plt_dat, colr, assay) %>% mutate(assay = as.integer(factor(assay, levels = assay)))
+  }
+  
+  # Get values for vertical lines to separate colours
+  vlines <- plt_dat %>% count(colr) %>% mutate(vline = cumsum(n) + 0.5) %>% dplyr::slice(-nrow(.))
+  
+  # Change colour name to 'ns' if not significant (if desired)
+  if (ns_grey) {
+    plt_dat <- mutate(plt_dat,
+                      # Keep the original colour names if needed
+                      colr_og = colr,
+                      colr = case_when(fdr < signif_threshold ~ colr, T ~ "ns"),
+                      colr = factor(colr, levels = c(setdiff(as.character(sort(unique(colr))), "ns"), "ns"))) %>%
+      # Change order of rows to ensure that ns points are underneath other points
+      arrange(desc(colr))
+  }
+  
+  # Mirrored Manhattan plot of results
+  mmplt <- plt_dat %>%
+    ggplot(aes(x = assay, y = median_diff, size = -log10(fdr),
+               colour = if (!all(is.na(colr_by)) | ns_grey) colr else NULL))
+  if (sep_by_colr) {mmplt <- mmplt +
+    geom_vline(xintercept = vlines$vline, colour = "grey", linetype = "dashed")}
+  mmplt <- mmplt +
+    geom_point() +
+    geom_hline(yintercept = 0, colour = "black", linetype = "dashed") +
+    colr_scale +
+    # Make y-axis limits symmetric around 0
+    scale_y_continuous(limits = center_limits()) +
+    labs(y = "∆Change", x = NULL, colour = "Panel", size = "-log10(FDR)") +
+    theme_classic(14) +
+    theme(axis.text.x = element_blank(),
+          axis.line.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.title.x = element_blank(),
+          legend.position = "bottom") +
+    guides(colour = guide_legend(override.aes = list(size = 3)))
+  if (strat_log) {
+    mmplt <- mmplt + facet_wrap(as.formula(paste0("~ ", strat_name)), ncol = 1)
+  }
+  
+  # Volcano plot
+  vplt <- plt_dat %>%
+    ggplot(aes(x = median_diff, y = -log10(fdr), colour = colr)) +
+    geom_point(size = 2.5, show.legend = F) +
+    geom_hline(yintercept = -log10(signif_threshold), linetype = "dashed") +
+    colr_scale +
+    scale_x_continuous(limits = center_limits()) +
+    theme_classic() +
+    geom_text_repel(
+      data = subset(plt_dat, fdr < 0.05),
+      aes(label = str_remove(assay, "_Phase \\d")),  # Use the `protein` column as the label
+      color = "black",
+      box.padding = 0.2,
+      max.overlaps = Inf
+    ) +
+    geom_vline( xintercept = 0, linetype = "dashed", col = "grey") #+
+  #labs( title = paste("Comparing ", comparison))
+  # Faceting based on panels and stratification (Volcano on top of each ohter)
+  # if (strat_log | !all(is.na(colr_by))) {
+  #   vplt <- vplt + facet_grid(if (strat_log) {rows = vars(get(strat_name))} else {rows = NULL},
+  #                             if (sep_by_colr) {cols = case_when(ns_grey ~ vars(colr_og), T ~ vars(colr))}
+  #                             else {cols = NULL},
+  #                             axes = "all_x")
+  # }
+  # Faceting based on panels and stratification (Volcano next to each other)
+  if (strat_log || !all(is.na(colr_by))) {
+    vplt <- vplt + facet_grid(cols = if (strat_log) {vars(get(strat_name))} else {NULL},
+                              rows = if (sep_by_colr) {case_when(ns_grey ~ vars(colr_og), T ~ vars(colr))}
+                              else {NULL}, axes = "all_y")
+  }
+  
+  rm(list = setdiff(ls(), c("mmplt", "vplt", "colr_by", "ns_grey", "strat_log", "strat_name")))
+  
+  return(list(mm = mmplt, volcano = vplt))
+}
+
+```
+
+### Comparing protein levels in seronegative versus infected subjects (Fig. S18):
+
+```{r}
+
+### Comparing change in protein levels in phase 1 and phase 2 between seronegative and infected:
+library(dplyr)
+library(purrr)
+library(progress)
+
+# PARAMETERS
+n_runs <- 100
+#min_percentage <- 0.70   # final required frequency
+fdr_cutoff <- 0.05
+seed_base <- 123
+
+# Precompute group sizes
+n12 <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 3", clust_traj12 == "12") %>%
+  distinct(idnr) %>% nrow()
+
+# Get random IDs in group 11
+group11_ids <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 3", clust_traj12 == "11") %>%
+  distinct(idnr) %>% pull(idnr)
+
+# Function for subsampling iteration
+run_one_subsample <- function(i) {
+  set.seed(seed_base + i)
+  
+  # randomly sample n12 subjects from group11 (with replacement)
+  sampled_11 <- sample(group11_ids, size = n12, replace = TRUE)
+  
+  # build data_list for analysis: keep group12 and the sampled group11 subjects
+  data_subset <- time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 3") %>%
+    filter(clust_traj12 == "12" | idnr %in% sampled_11)
+  
+  data_list <- list(
+    values = data_subset %>%
+      dplyr::select(sample_id, all_of(olink_proteins_ta)),
+    sinfo = data_subset %>%
+      dplyr::select(idnr, sample_id, sampling_phase, clust_traj12, male)
+  )
+  
+  # Run within-phase comparison:
+  # lm_11_12 <- lm_analysis(data_list, "sample_id", predictor = "clust_traj12", covar = "male", stratify_by = "sampling_phase")
+  
+  # Run the delta-delta analysis (difference between in change between Phase1 and Phase2 for each group)
+  lm_dd <- lm_analysis(
+    data_list,
+    "sample_id",
+    predictor = "clust_traj12",
+    covar = "male",
+    difference_col = "sampling_phase",
+    individual_id = "idnr",
+    differences_between = c("Phase 1", "Phase 2")
+  )
+  
+  # lm_dd$results expected to be a data.frame with columns: assay, estimate, pvalue, fdr
+  res <- lm_dd$results %>%
+    mutate(iter = i) %>%
+    dplyr::select(assay, median_diff, estimate, p_value, fdr, iter)
+  
+  # Return list of significant assays this run
+  sig_assays <- res %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  list(results = res, significant = sig_assays)
+}
+
+
+
+# Run many iterations (serial)
+pb <- progress_bar$new(total = n_runs)
+all_iter_results <- vector("list", n_runs)
+for (i in seq_len(n_runs)) {
+  iter_out <- tryCatch({
+    out <- run_one_subsample(i)
+    pb$tick()
+    out
+  }, error = function(e) {
+    pb$tick()
+    message("Error in iteration ", i, ": ", e$message)
+    list(results = tibble(assay = character(), median_diff = numeric(), estimate = numeric(), pvalue = numeric(), fdr = numeric(), iter = integer()),
+         significant = character(0))
+  })
+  all_iter_results[[i]] <- iter_out
+}
+
+# -----------------------
+# Aggregate outputs
+# -----------------------
+
+# 1) Frequency table: how many times each assay was significant
+all_sig_lists <- map(all_iter_results, "significant")
+all_sig_flat <- unlist(all_sig_lists)
+protein_counts <- sort(table(all_sig_flat), decreasing = TRUE)
+protein_counts_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+# 2) Collect all per-iteration results (estimates, p-values)
+all_results_df <-all_iter_results %>%
+  map("results") %>%
+  list_rbind()
+
+# compute median estimate, proportion of runs with significant p (or fdr), direction consistency
+summary_df <- all_results_df %>%
+  group_by(assay) %>%
+  summarise(
+    median_median_diff = median( median_diff, na.rm = TRUE),
+    median_estimate = median(estimate, na.rm = TRUE),
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    prop_pos = mean(estimate > 0, na.rm = TRUE),
+    prop_neg = mean(estimate < 0, na.rm = TRUE),
+    prop_sig = mean(fdr < fdr_cutoff, na.rm = TRUE),
+    n_non_na = sum(!is.na(estimate)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(prop_sig), desc(prop_pos))
+
+
+### Visualize it:
+library(wesanderson)
+
+# Define significance thresholds for visualization
+high_confidence <- 0.8   # Proteins significant in 80%+ of runs
+moderate_confidence <- 0.5 # Proteins significant in 50%+ of runs
+
+# Create a robustness category
+plot_data <- summary_df %>%
+  filter(prop_sig > 0) %>%
+  mutate(
+    robustness = case_when(
+      prop_sig >= high_confidence ~ "High confidence",
+      prop_sig >= moderate_confidence ~ "Moderate confidence",
+      TRUE ~ "Low confidence"
+    ),
+    robustness = factor(robustness, levels = c("High confidence", "Moderate confidence", "Low confidence")),
+    # Create size based on prop_sig for better visual emphasis
+    point_size = prop_sig * 6 + 1,
+    # Label only high confidence proteins or those with very large effects
+    should_label = prop_sig >= high_confidence | abs(median_estimate) > 0.4
+  )
+
+
+# Plot 2: Lollipop chart for top proteins (emphasizes ranking)
+top_proteins <- plot_data %>%
+  filter(prop_sig >= 0.01) %>%  # Only show proteins with some robustness
+  slice_max(prop_sig, n = 20) %>%
+  mutate(assay = reorder(assay, prop_sig))
+
+plot2_lollipop <- ggplot(top_proteins, aes(x = prop_sig, y = assay)) +
+  # Lollipop stems
+  geom_segment(aes(x = 0, xend = prop_sig, y = assay, yend = assay), 
+               color = "gray50", size = 0.8) +
+  
+  # Lollipop heads colored by direction and sized by robustness
+  #geom_point(aes(color = median_estimate > 0, size = prop_sig * 6)) +
+  geom_point(aes(color = median_median_diff > 0, size = prop_sig * 6)) +
+  #geom_text(aes(label = sprintf("%.2f", median_estimate)), 
+  #          hjust = -0.2, size = 3) +
+  geom_text(aes(label = sprintf("%.2f", median_median_diff)), 
+            hjust = -0.2, size = 3) +
+  # Reference lines
+  geom_vline(xintercept = c(moderate_confidence, high_confidence), 
+             linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(
+    values = c("TRUE" = "#D51F26", "FALSE" = "#2E86AB"),
+    labels = c("Negative effect", "Positive effect"),
+    name = "Direction"
+  ) +
+  #scale_size_identity() +
+  scale_x_continuous(labels = scales::percent_format(), 
+                     limits = c(0, max(top_proteins$prop_sig) * 1)) +
+  labs(
+    title = "Proteins with significant difference in change between subjects who gain infection vs naive",
+    subtitle = "Bootstrapping naive group for 100 iterations",
+    x = "Proportion of iterations significant",
+    y = "Protein",
+    # caption = "Numbers show median effect size"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14),
+    axis.text.y = element_text(size = 9),
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  guides(size = "none")
+
+#------------------------------------------------------------------------------------------------------------------
+
+### Compare differences in protein levels between infected (phase 2) and non infected (phase 2) at phase 1 and phase 2:
+
+n_runs <- 100 # 500
+fdr_cutoff <- 0.05
+seed_base <- 123
+
+library(dplyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(progress)
+
+# Precompute group sizes
+n12 <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 3", clust_traj12 == "12") %>%
+  distinct(idnr) %>%
+  nrow()
+
+# Get random IDs in group 11
+group11_ids <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 3", clust_traj12 == "11") %>%
+  distinct(idnr) %>%
+  pull(idnr)
+
+# Function for bootstrap iteration
+run_one_bootstrap_within_phase <- function(i) {
+  set.seed(seed_base + i)
+  
+  # randomly sample n12 subjects from group11 (WITH replacement for bootstrap)
+  sampled_11 <- sample(group11_ids, size = n12, replace = TRUE)
+  
+  # build data_list for analysis: keep group12 and the sampled group11 subjects
+  data_subset <- time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 3") %>%
+    filter(clust_traj12 == "12" | idnr %in% sampled_11)
+  
+  data_list <- list(
+    values = data_subset %>%
+      dplyr::select(sample_id, all_of(olink_proteins_ta)),     # adjust variable name if needed
+    sinfo = data_subset %>%
+      dplyr::select(idnr, sample_id, sampling_phase, clust_traj12, male)
+  )
+  
+  # Run the delta-delta analysis (difference in change between Phase1 and Phase2 for each group)
+  lm_dd <- lm_analysis(
+    data_list,
+    "sample_id",
+    predictor = "clust_traj12",
+    covar = "male",
+    stratify_by = "sampling_phase"
+    # difference_col = "sampling_phase",
+    #  individual_id = "idnr",
+    # differences_between = c("Phase 1", "Phase 2")
+  )
+  
+  # lm_dd$results expected to be a data.frame with columns: assay, estimate, p_value, fdr
+  res <- lm_dd$results %>%
+    mutate(iter = i) %>%
+    dplyr::select(assay, sampling_phase, median_diff, estimate, p_value, fdr, iter)
+  
+  # Return list of significant assays this run
+  sig_assays_p1 <- res %>%filter(sampling_phase == "Phase 1") %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  sig_assays_p2 <- res %>%filter(sampling_phase == "Phase 2") %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  list(results = res, significant_p1 = sig_assays_p1, significant_p2 = sig_assays_p2)
+}
+
+# Run many iterations (serial)
+pb <- progress_bar$new(total = n_runs)
+all_iter_results <- vector("list", n_runs)
+for (i in seq_len(n_runs)) {
+  iter_out <- tryCatch({
+    out <- run_one_bootstrap_within_phase(i)
+    pb$tick()
+    out
+  }, error = function(e) {
+    pb$tick()
+    message("Error in iteration ", i, ": ", e$message)
+    list(results = tibble(assay = character(), median_diff = numeric(), estimate = numeric(), p_value = numeric(), fdr = numeric(), iter = integer()),
+         significant_p1 = character(0),
+         significant_p2 = character(0))
+  })
+  all_iter_results[[i]] <- iter_out
+}
+
+# Aggregate bootstrap outputs
+# Frequency table: how many times each assay was significant
+all_sig_lists_p1 <- map(all_iter_results, "significant_p1")
+all_sig_flat_p1 <- unlist(all_sig_lists_p1)
+protein_counts <- sort(table(all_sig_flat_p1), decreasing = TRUE)
+protein_counts_p1_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+all_sig_lists_p2 <- map(all_iter_results, "significant_p2")
+all_sig_flat_p2 <- unlist(all_sig_lists_p2)
+protein_counts <- sort(table(all_sig_flat_p2), decreasing = TRUE)
+protein_counts_p2_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+
+# Collect all per-iteration results (estimates, p-values)
+all_results_df <- all_iter_results %>%
+  map("results") %>%
+  list_rbind()
+
+# Compute summary statistics and 95% confidence intervals per assay
+summary_df <- all_results_df %>%
+  group_by(sampling_phase, assay) %>%
+  summarise(
+    median_median_diff = median( median_diff, na.rm = TRUE),
+    median_estimate = median(estimate, na.rm = TRUE),
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    lower_95 = quantile(estimate, 0.025, na.rm = TRUE),
+    upper_95 = quantile(estimate, 0.975, na.rm = TRUE),
+    prop_pos = mean(estimate > 0, na.rm = TRUE),
+    prop_neg = mean(estimate < 0, na.rm = TRUE),
+    prop_sig = mean(fdr < fdr_cutoff, na.rm = TRUE),
+    n_non_na = sum(!is.na(estimate)),
+    fdr_median = median(fdr),
+    fdr_mean = mean(fdr),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(prop_sig), desc(prop_pos))
+
+summary_df_1112 <- summary_df
+### Plot Volcano plot:
+library(ggh4x)
+volcano_1112_baseline <- ggplot(summary_df_1112, aes( x = median_median_diff, y = -log10(fdr_median))) +
+  geom_point( aes( color = prop_sig, size = prop_sig)) +
+  facet_wrap(~sampling_phase) +
+  theme_classic() +
+  #theme_bw() +
+  geom_text_repel(
+    data = subset(summary_df_1112, prop_sig > 0.1),
+    aes(label = str_remove(assay, "_Phase \\d")),  # Use the `protein` column as the label
+    color = "black",
+    box.padding = 0.5,
+    max.overlaps = Inf
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  #colr_scale +
+  scale_x_continuous(limits = center_limits()) +
+  scale_color_gradientn(
+    colors = c("grey80", wes_palette("Zissou1", 100, type = "continuous")),
+    values = scales::rescale(c(0, 0.0001, 1)),  # Grey for 0, then gradient starts
+    limits = c(0, 1),
+    name = "Proportion\nsignificant"
+  ) +
+  scale_y_continuous(breaks = round(seq(0, max(-log10(summary_df$fdr_median)+2), by = 1),1)) +
+  labs(
+    title = "Subjects who gain infection in phase 2 vs naive",
+    subtitle = "Bootstrapping naive group for 100 iterations",
+    x = "Median difference between groups",
+    y = "-log10(FDR)"
+  ) +
+  geom_vline( xintercept = 0, linetype = "dashed", color = "grey")
+
+
+
+
+#----------------------------------------------------------------------------------------------------------------
+### Plot protein level and calculate significant using wilcox:
+## Calculate statistical result function:
+
+# Function to perform statistical tests for each protein
+calculate_protein_stats <- # function(proteins_of_interest, data) {
+  function(proteins_of_interest_tad, data) {
+    
+    results_list <- list()
+    
+    #for(protein in proteins_of_interest) {
+    for(protein in proteins_of_interest_tad) {
+      
+      cat("Processing protein:", protein, "\n")
+      
+      # Prepare data for this protein
+      protein_data <- data %>% 
+        filter(idnr %in% sminet_infected_subjects) %>%
+        mutate(
+          time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+          time_since_sminet_group = case_when(
+            time_since_sminet < 0 ~ "pre",
+            time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+            time_since_sminet > 30 ~ "30+"
+          ),
+          time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30", "30+"))
+        ) %>%
+        filter(Time_Sample_Dose1 < 0) %>%
+        filter( ! sampling_phase == "Phase 3") |> # this is only one sample. remove so we only have one pre and post sample per subject
+        pivot_longer(cols = all_of(proteins_of_interest[-grep("PKLR|GLOD4|DNPH1", proteins_of_interest)]), names_to = "assay", values_to = "npx") %>%
+        filter(assay == protein)
+      
+      # Initialize results for this protein
+      protein_results <- data.frame(
+        protein = protein,
+        p_value_pre_vs_0_30 = NA,
+        eff_size_pre_vs_0_30 = NA,     # <-- Added
+        p_value_pre_vs_30plus = NA,
+        eff_size_pre_vs_30plus = NA,   # <-- Added
+        p_value_0_30_vs_30plus = NA,
+        eff_size_0_30_vs_30plus = NA,  # <-- Added
+        n_pre = 0,
+        n_0_30 = 0,
+        n_30plus = 0,
+        n_paired_pre_0_30 = 0,
+        n_paired_pre_30plus = 0,
+        test_type_pre_0_30 = NA,
+        test_type_pre_30plus = NA,
+        test_type_0_30_30plus = NA
+      )
+      
+      # Count samples in each group
+      protein_results$n_pre <- sum(protein_data$time_since_sminet_group == "pre", na.rm = TRUE)
+      protein_results$n_0_30 <- sum(protein_data$time_since_sminet_group == "0-30", na.rm = TRUE)
+      protein_results$n_30plus <- sum(protein_data$time_since_sminet_group == "30+", na.rm = TRUE)
+      
+      # Test 1: pre vs 0-30 (paired if same subjects exist in both groups)
+      pre_data <- protein_data %>% filter(time_since_sminet_group == "pre")
+      group_0_30_data <- protein_data %>% filter(time_since_sminet_group == "0-30")
+      
+      # Find subjects present in both pre and 0-30 groups
+      paired_subjects_pre_0_30 <- intersect(pre_data$idnr, group_0_30_data$idnr)
+      protein_results$n_paired_pre_0_30 <- length(paired_subjects_pre_0_30)
+      
+      if(length(paired_subjects_pre_0_30) >= 5) {  # Minimum 5 pairs for meaningful paired test
+        # Paired Wilcoxon
+        pre_paired <- pre_data %>% filter(idnr %in% paired_subjects_pre_0_30) %>% arrange(idnr)
+        group_0_30_paired <- group_0_30_data %>% filter(idnr %in% paired_subjects_pre_0_30) %>% arrange(idnr)
+        
+        if(nrow(pre_paired) == nrow(group_0_30_paired)) {
+          test_result <- wilcox.test(x = pre_paired$npx, y = group_0_30_paired$npx, paired = TRUE, alternative = "two.sided")
+          protein_results$p_value_pre_vs_0_30 <- test_result$p.value
+          protein_results$eff_size_pre_vs_0_30 <- get_wilcox_effect_size(pre_paired$npx, group_0_30_paired$npx, paired = TRUE) #new
+          protein_results$test_type_pre_0_30 = "paired_wilcoxon"
+        }
+      } else if(nrow(pre_data) >= 3 && nrow(group_0_30_data) >= 3) {
+        # Unpaired t-test if not enough pairs
+        # test_result <- t.test(pre_data$npx, group_0_30_data$npx, paired = FALSE)
+        test_result <- wilcox.test(pre_data$npx, group_0_30_data$npx, paired = FALSE)
+        protein_results$p_value_pre_vs_0_30 <- test_result$p.value
+        protein_results$eff_size_pre_vs_0_30 <- get_wilcox_effect_size(pre_data$npx, group_0_30_data$npx, paired = FALSE) #new
+        protein_results$test_type_pre_0_30 = "unpaired_wilcoxon"
+      }
+      
+      # Test 2: pre vs 30+ (paired if same subjects exist in both groups)
+      group_30plus_data <- protein_data %>% filter(time_since_sminet_group == "30+")
+      
+      # Find subjects present in both pre and 30+ groups
+      paired_subjects_pre_30plus <- intersect(pre_data$idnr, group_30plus_data$idnr)
+      protein_results$n_paired_pre_30plus <- length(paired_subjects_pre_30plus)
+      
+      if(length(paired_subjects_pre_30plus) >= 5) {  # Minimum 5 pairs for meaningful paired test
+        # Paired Wilcoxon
+        pre_paired <- pre_data %>% filter(idnr %in% paired_subjects_pre_30plus) %>% arrange(idnr)
+        group_30plus_paired <- group_30plus_data %>% filter(idnr %in% paired_subjects_pre_30plus) %>% arrange(idnr)
+        
+        if(nrow(pre_paired) == nrow(group_30plus_paired)) {
+          test_result <- wilcox.test(pre_paired$npx, group_30plus_paired$npx, paired = TRUE )
+          protein_results$p_value_pre_vs_30plus <- test_result$p.value
+          protein_results$eff_size_pre_vs_30plus <- get_wilcox_effect_size(pre_paired$npx, group_30plus_paired$npx, paired = TRUE) #new
+          protein_results$test_type_pre_30plus = "paired_wilcoxon"
+        }
+      } else if(nrow(pre_data) >= 3 && nrow(group_30plus_data) >= 3) {
+        test_result <- wilcox.test(pre_data$npx, group_30plus_data$npx, paired = FALSE)
+        protein_results$p_value_pre_vs_30plus <- test_result$p.value
+        protein_results$eff_size_pre_vs_30plus <- get_wilcox_effect_size(pre_data$npx, group_30plus_data$npx, paired = FALSE)
+        protein_results$test_type_pre_30plus = "unpaired_wilcoxon"
+      }
+      
+      # Test 3: 0-30 vs 30+ (unpaired - different subjects)
+      if(nrow(group_0_30_data) >= 3 && nrow(group_30plus_data) >= 3) {
+        test_result <- wilcox.test(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE)
+        protein_results$p_value_0_30_vs_30plus <- test_result$p.value
+        protein_results$eff_size_0_30_vs_30plus <- get_wilcox_effect_size(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE) #new
+        protein_results$test_type_0_30_30plus = "unpaired_wilcoxon"
+      }
+      
+      results_list[[protein]] <- protein_results
+    }
+    
+    # Combine results
+    all_results <- do.call(rbind, results_list)
+    
+    # Apply FDR correction to each p-value column
+    all_results$p_adj_pre_vs_0_30 <- p.adjust(all_results$p_value_pre_vs_0_30, method = "fdr")
+    all_results$p_adj_pre_vs_30plus <- p.adjust(all_results$p_value_pre_vs_30plus, method = "fdr")
+    all_results$p_adj_0_30_vs_30plus <- p.adjust(all_results$p_value_0_30_vs_30plus, method = "fdr")
+    
+    # Add significance indicators
+    all_results$sig_pre_vs_0_30 <- case_when(
+      all_results$p_adj_pre_vs_0_30 < 0.001 ~ "***",
+      all_results$p_adj_pre_vs_0_30 < 0.01 ~ "**",
+      all_results$p_adj_pre_vs_0_30 < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    all_results$sig_pre_vs_30plus <- case_when(
+      all_results$p_adj_pre_vs_30plus < 0.001 ~ "***",
+      all_results$p_adj_pre_vs_30plus < 0.01 ~ "**",
+      all_results$p_adj_pre_vs_30plus < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    all_results$sig_0_30_vs_30plus <- case_when(
+      all_results$p_adj_0_30_vs_30plus < 0.001 ~ "***",
+      all_results$p_adj_0_30_vs_30plus < 0.01 ~ "**",
+      all_results$p_adj_0_30_vs_30plus < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    return(all_results)
+    
+  } ## END function
+
+##                             Plot function for pre and post infection exl vaccinated:
+create_plots_with_ggsignif <- function(proteins_of_interest, data, statistical_results) {
+  
+  # You'll need: install.packages("ggsignif")
+  library(ggsignif)
+  
+  plot_list <- lapply(proteins_of_interest, function(protein) {
+    
+    # Get statistical results for this protein
+    protein_stats <- statistical_results %>% 
+      filter(protein == !!protein)
+    
+    # Prepare plot data
+    plot_data <- data %>% 
+      filter(idnr %in% sminet_infected_subjects) %>%
+      mutate(
+        time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+        time_since_sminet_group = case_when(
+          time_since_sminet < 0 ~ "pre",
+          time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+          time_since_sminet > 30 ~ "30+"
+        ),
+        time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30",  "30+"))
+      ) %>%
+      filter(Time_Sample_Dose1 < 0) %>%
+      filter( ! sampling_phase == "Phase 3") |>
+      pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "npx") %>%
+      #pivot_longer(cols = proteins_of_interest, names_to = "assay", values_to = "npx") %>%
+      filter(assay == protein)
+    
+    # Prepare significance annotations with test info
+    comparisons <- list()
+    annotations <- c()
+    
+    if(!is.na(protein_stats$p_adj_pre_vs_0_30)) {
+      comparisons <- append(comparisons, list(c("pre", "0-30")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_pre_vs_0_30, "\n(", protein_stats$test_type_pre_0_30, ")"
+      ))
+    }
+    
+    if(!is.na(protein_stats$p_adj_pre_vs_30plus)) {
+      comparisons <- append(comparisons, list(c("pre", "30+")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_pre_vs_30plus, "\n(", protein_stats$test_type_pre_30plus, ")"
+      ))
+    }
+    
+    if(!is.na(protein_stats$p_adj_0_30_vs_30plus)) {
+      comparisons <- append(comparisons, list(c("0-30", "30+")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_0_30_vs_30plus, "\n(", protein_stats$test_type_0_30_30plus, ")"
+      ))
+    }
+  
+    p1 <- ggplot(plot_data, aes(x = time_since_sminet_group, y = npx, group = idnr)) +
+      geom_beeswarm(aes( my_col = time_since_sminet_group, my_x = time_since_sminet_group))
+    pb <- ggplot_build(p1)
+    
+    p <- ggplot(pb$data[[1]], aes(x = x, y = y, group = group)) +
+      geom_line(aes(group = group), col = "grey80", alpha = 0.2) +
+      geom_point( aes( color = my_col), size = 3, alpha = 0.6) +
+      theme_classic() +
+      scale_x_discrete() +
+      labs(title = protein, y = "ProtPQN NPX [AU]", x = "Days since PCR+", subtitle = "Subjects with PCR+ confirmed infection, no vaccination") +
+      geom_boxplot(aes(x = my_x, y = y, group = my_x), outlier.shape = NA, fill = NA) +
+      scale_color_manual( values = c("grey", "red", "orange")) +
+      guides(color="none")
+    
+    
+    # Add significance brackets if we have comparisons
+    if(length(comparisons) > 0) {
+      p <- p + geom_signif(
+        comparisons = comparisons,
+        annotations = annotations,
+        step_increase = 0.1,
+        textsize = 2.5
+      )
+    }
+    
+    return(p)
+  })
+  
+  names(plot_list) <- proteins_of_interest
+  return(plot_list)
+}
+
+
+## Call function to create the plots:
+proteins_of_interest_tad <- proteins_of_interest[-grep("PKLR|GLOD4|DNPH1", proteins_of_interest )]
+
+statistical_results_timeadjust <- calculate_protein_stats(proteins_of_interest_tad, time_adjusted_data_si)
+enhanced_plots_timeadjust <- create_plots_with_ggsignif(proteins_of_interest_tad, time_adjusted_data_si, statistical_results_timeadjust)
+
+########## Protein levels pre and post infection but include vaccinated samples:
+# Function to perform statistical tests for each protein
+calculate_protein_stats_vi <- # function(proteins_of_interest, data) {
+  function(proteins_of_interest_tad, data) {
+    
+    results_list <- list()
+    
+    #for(protein in proteins_of_interest) {
+    for(protein in proteins_of_interest_tad) {
+      
+      cat("Processing protein:", protein, "\n")
+      
+      # Prepare data for this protein
+      protein_data <- data %>% 
+        filter(idnr %in% sminet_infected_subjects) %>%
+        mutate(
+          time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+          time_since_sminet_group = case_when(
+            time_since_sminet < 0 ~ "pre",
+            time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+            time_since_sminet > 30 ~ "30+"
+          ),
+          time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30", "30+"))
+        ) %>%
+        pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "npx") %>%
+        filter(assay == protein)
+      
+      # Initialize results for this protein
+      protein_results <- data.frame(
+        protein = protein,
+        p_value_pre_vs_0_30 = NA,
+        eff_size_pre_vs_0_30 = NA,     # <-- Added
+        p_value_pre_vs_30plus = NA,
+        eff_size_pre_vs_30plus = NA,   # <-- Added
+        p_value_0_30_vs_30plus = NA,
+        eff_size_0_30_vs_30plus = NA,  # <-- Added
+        n_pre = 0,
+        n_0_30 = 0,
+        n_30plus = 0,
+        n_paired_pre_0_30 = 0,
+        n_paired_pre_30plus = 0,
+        test_type_pre_0_30 = NA,
+        test_type_pre_30plus = NA,
+        test_type_0_30_30plus = NA
+      )
+      
+      # Count samples in each group
+      protein_results$n_pre <- sum(protein_data$time_since_sminet_group == "pre", na.rm = TRUE)
+      protein_results$n_0_30 <- sum(protein_data$time_since_sminet_group == "0-30", na.rm = TRUE)
+      protein_results$n_30plus <- sum(protein_data$time_since_sminet_group == "30+", na.rm = TRUE)
+      
+      # Test 1: pre vs 0-30 (paired if same subjects exist in both groups)
+      pre_data <- protein_data %>% filter(time_since_sminet_group == "pre")
+      group_0_30_data <- protein_data %>% filter(time_since_sminet_group == "0-30")
+      
+      # Find subjects present in both pre and 0-30 groups
+      paired_subjects_pre_0_30 <- intersect(pre_data$idnr, group_0_30_data$idnr)
+      protein_results$n_paired_pre_0_30 <- length(paired_subjects_pre_0_30)
+      test_result <- wilcox.test(pre_data$npx, group_0_30_data$npx, paired = FALSE)
+      protein_results$p_value_pre_vs_0_30 <- test_result$p.value
+      protein_results$eff_size_pre_vs_0_30 <- get_wilcox_effect_size(pre_data$npx, group_0_30_data$npx, paired = FALSE) #new
+      protein_results$test_type_pre_0_30 = "unpaired_wilcoxon"
+      
+      # }
+      
+      # Test 2: pre vs 30+ (paired if same subjects exist in both groups)
+      group_30plus_data <- protein_data %>% filter(time_since_sminet_group == "30+")
+      
+      # Find subjects present in both pre and 30+ groups
+      paired_subjects_pre_30plus <- intersect(pre_data$idnr, group_30plus_data$idnr)
+      protein_results$n_paired_pre_30plus <- length(paired_subjects_pre_30plus)
+      
+      #if(length(paired_subjects_pre_30plus) >= 5) {  # Minimum 5 pairs for meaningful paired test
+      # Paired t-test
+      pre_paired <- pre_data %>% filter(idnr %in% paired_subjects_pre_30plus) %>% arrange(idnr)
+      group_30plus_paired <- group_30plus_data %>% filter(idnr %in% paired_subjects_pre_30plus) %>% arrange(idnr)
+      
+      test_result <- wilcox.test(pre_data$npx, group_30plus_data$npx, paired = FALSE)
+      protein_results$p_value_pre_vs_30plus <- test_result$p.value
+      protein_results$eff_size_pre_vs_30plus <- get_wilcox_effect_size(pre_data$npx, group_30plus_data$npx, paired = FALSE)
+      protein_results$test_type_pre_30plus = "unpaired_wilcoxon"
+      #  }
+      
+      # Test 3: 0-30 vs 30+ (unpaired - different subjects)
+      if(nrow(group_0_30_data) >= 3 && nrow(group_30plus_data) >= 3) {
+        #test_result <- t.test(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE)
+        test_result <- wilcox.test(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE)
+        protein_results$p_value_0_30_vs_30plus <- test_result$p.value
+        protein_results$eff_size_0_30_vs_30plus <- get_wilcox_effect_size(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE) #new
+        protein_results$test_type_0_30_30plus = "unpaired_wilcoxon"
+      }
+      
+      results_list[[protein]] <- protein_results
+    }
+    
+    # Combine results
+    all_results <- do.call(rbind, results_list)
+    
+    # Apply FDR correction to each p-value column
+    all_results$p_adj_pre_vs_0_30 <- p.adjust(all_results$p_value_pre_vs_0_30, method = "fdr")
+    all_results$p_adj_pre_vs_30plus <- p.adjust(all_results$p_value_pre_vs_30plus, method = "fdr")
+    all_results$p_adj_0_30_vs_30plus <- p.adjust(all_results$p_value_0_30_vs_30plus, method = "fdr")
+    
+    # Add significance indicators
+    all_results$sig_pre_vs_0_30 <- case_when(
+      all_results$p_adj_pre_vs_0_30 < 0.001 ~ "***",
+      all_results$p_adj_pre_vs_0_30 < 0.01 ~ "**",
+      all_results$p_adj_pre_vs_0_30 < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    all_results$sig_pre_vs_30plus <- case_when(
+      all_results$p_adj_pre_vs_30plus < 0.001 ~ "***",
+      all_results$p_adj_pre_vs_30plus < 0.01 ~ "**",
+      all_results$p_adj_pre_vs_30plus < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    all_results$sig_0_30_vs_30plus <- case_when(
+      all_results$p_adj_0_30_vs_30plus < 0.001 ~ "***",
+      all_results$p_adj_0_30_vs_30plus < 0.01 ~ "**",
+      all_results$p_adj_0_30_vs_30plus < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    return(all_results)
+  }
+
+
+# Plot
+create_plots_with_ggsignif_vi <- function(proteins_of_interest, data, statistical_results) {
+  
+  # You'll need: install.packages("ggsignif")
+  library(ggsignif)
+  
+  plot_list <- lapply(proteins_of_interest, function(protein) {
+    
+    # Get statistical results for this protein
+    protein_stats <- statistical_results %>% 
+      filter(protein == !!protein)
+    
+    # Prepare plot data
+    plot_data <- data %>% 
+      filter(idnr %in% sminet_infected_subjects) %>%
+      mutate(
+        time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+        time_since_sminet_group = case_when(
+          time_since_sminet < 0 ~ "pre",
+          time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+          time_since_sminet > 30 ~ "30+"),
+        vaccinated = case_when( Time_Sample_Dose1 <= 0 ~ "No",
+                                T ~ "Yes"),
+        time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30",  "30+"))
+      ) %>%
+      #filter(Time_Sample_Dose1 < 0) %>%
+      #     filter( ! sampling_phase == "Phase 3") |>
+      pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "npx") %>%
+      #pivot_longer(cols = proteins_of_interest, names_to = "assay", values_to = "npx") %>%
+      filter(assay == protein)
+    
+    # Prepare significance annotations with test info
+    comparisons <- list()
+    annotations <- c()
+    
+    if(!is.na(protein_stats$p_adj_pre_vs_0_30)) {
+      comparisons <- append(comparisons, list(c("pre", "0-30")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_pre_vs_0_30, "\n(", protein_stats$test_type_pre_0_30, ")"
+      ))
+    }
+    
+    if(!is.na(protein_stats$p_adj_pre_vs_30plus)) {
+      comparisons <- append(comparisons, list(c("pre", "30+")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_pre_vs_30plus, "\n(", protein_stats$test_type_pre_30plus, ")"
+      ))
+    }
+    
+    if(!is.na(protein_stats$p_adj_0_30_vs_30plus)) {
+      comparisons <- append(comparisons, list(c("0-30", "30+")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_0_30_vs_30plus, "\n(", protein_stats$test_type_0_30_30plus, ")"
+      ))
+    }
+    
+    p1 <- ggplot(plot_data, aes(x = time_since_sminet_group, y = npx, group = idnr)) +
+      geom_beeswarm(aes( my_col = time_since_sminet_group, my_x = time_since_sminet_group, my_shape = vaccinated))
+    pb <- ggplot_build(p1)
+    
+    p <- ggplot(pb$data[[1]], aes(x = x, y = y, group = group)) +
+      geom_line(aes(group = group), col = "grey80", alpha = 0.2) +
+      geom_point( aes( color = my_col, shape = my_shape), size = 3, alpha = 0.6) +
+      theme_classic() +
+      scale_x_discrete() +
+      labs(title = protein, y = "ProtPQN NPX [AU]", x = "Days since PCR+", subtitle = "Subjects with PCR+ confirmed infection and possibly vaccinated subjects") +
+      geom_boxplot(aes(x = my_x, y = y, group = my_x), outlier.shape = NA, fill = NA) +
+      scale_color_manual( values = c("grey", "red", "orange")) +
+      guides(color="none")
+    
+    # Add significance brackets if we have comparisons
+    if(length(comparisons) > 0) {
+      p <- p + geom_signif(
+        comparisons = comparisons,
+        annotations = annotations,
+        step_increase = 0.1,
+        textsize = 2.5
+      )
+    }
+    
+    return(p)
+  })
+  
+  names(plot_list) <- proteins_of_interest
+  return(plot_list)
+}
+
+# Create the plots:
+statistical_results_timeadjust_vi <- calculate_protein_stats_vi(proteins_of_interest_tad, time_adjusted_data_si)
+enhanced_plots_timeadjust_vi <- create_plots_with_ggsignif_vi(proteins_of_interest_tad, time_adjusted_data_si, statistical_results_timeadjust_vi)
+
+#----------------------------------------------------------------------------------------------------------------
+### Plot protein level for vaccinated and calculate significant using wilcox:
+calculate_protein_stats_vaccine <- function(proteins_of_interest_tad, data) {
+    
+    results_list <- list()
+
+    for(protein in proteins_of_interest_tad) {
+      
+      cat("Processing protein:", protein, "\n")
+      
+      # Prepare data for this protein
+      protein_data <- data %>% 
+        filter(!cluster_maximum_6prot_omi %in% c("2", "3")) |>
+        mutate(
+          time_since_vaccination_group = case_when(
+            time_since_closest_date < 0 ~ "pre",
+            time_since_closest_date >= 0 & time_since_closest_date <= 30 ~ "0-30",
+            time_since_closest_date > 30 ~ "30+"
+          ),
+          time_since_vaccination_group = factor(time_since_vaccination_group, levels = c("pre", "0-30", "30+"))
+        ) %>%
+        pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "npx") %>%
+        filter(assay == protein)
+      
+      # Initialize results for this protein
+      protein_results <- data.frame(
+        protein = protein,
+        p_value_pre_vs_0_30 = NA,
+        eff_size_pre_vs_0_30 = NA,     # <-- Added
+        p_value_pre_vs_30plus = NA,
+        eff_size_pre_vs_30plus = NA,   # <-- Added
+        p_value_0_30_vs_30plus = NA,
+        eff_size_0_30_vs_30plus = NA,  # <-- Added
+        n_pre = 0,
+        n_0_30 = 0,
+        n_30plus = 0,
+        n_paired_pre_0_30 = 0,
+        n_paired_pre_30plus = 0,
+        test_type_pre_0_30 = NA,
+        test_type_pre_30plus = NA,
+        test_type_0_30_30plus = NA
+      )
+      
+      # Count samples in each group
+      protein_results$n_pre <- sum(protein_data$time_since_vaccination_group == "pre", na.rm = TRUE)
+      protein_results$n_0_30 <- sum(protein_data$time_since_vaccination_group == "0-30", na.rm = TRUE)
+      protein_results$n_30plus <- sum(protein_data$time_since_vaccination_group == "30+", na.rm = TRUE)
+      
+      # Test 1: pre vs 0-30 (paired if same subjects exist in both groups)
+      pre_data <- protein_data %>% filter(time_since_vaccination_group == "pre")
+      group_0_30_data <- protein_data %>% filter(time_since_vaccination_group == "0-30")
+      
+      # Find subjects present in both pre and 0-30 groups
+      paired_subjects_pre_0_30 <- intersect(pre_data$idnr, group_0_30_data$idnr)
+      protein_results$n_paired_pre_0_30 <- length(paired_subjects_pre_0_30)
+      
+      if(length(paired_subjects_pre_0_30) >= 5) {  # Minimum 5 pairs for meaningful paired test
+        # Paired t-test
+        pre_paired <- pre_data %>% filter(idnr %in% paired_subjects_pre_0_30) %>% arrange(idnr)
+        group_0_30_paired <- group_0_30_data %>% filter(idnr %in% paired_subjects_pre_0_30) %>% arrange(idnr)
+        
+        if(nrow(pre_paired) == nrow(group_0_30_paired)) {
+          #test_result <- t.test(pre_paired$npx, group_0_30_paired$npx, paired = TRUE)
+          test_result <- wilcox.test(pre_paired$npx, group_0_30_paired$npx, paired = TRUE)
+          protein_results$p_value_pre_vs_0_30 <- test_result$p.value
+          protein_results$eff_size_pre_vs_0_30 <- get_wilcox_effect_size(pre_paired$npx, group_0_30_paired$npx, paired = TRUE) #new
+          protein_results$test_type_pre_0_30 = "paired_wilcoxon"
+        }
+      } else if(nrow(pre_data) >= 3 && nrow(group_0_30_data) >= 3) {
+        # Unpaired t-test if not enough pairs
+        #test_result <- t.test(pre_data$npx, group_0_30_data$npx, paired = FALSE)
+        test_result <- wilcox.test(pre_data$npx, group_0_30_data$npx, paired = FALSE)
+        protein_results$p_value_pre_vs_0_30 <- test_result$p.value
+        protein_results$eff_size_pre_vs_0_30 <- get_wilcox_effect_size(pre_data$npx, group_0_30_data$npx, paired = FALSE) #new
+        protein_results$test_type_pre_0_30 = "unpaired_wilcoxon"
+      }
+      
+      # Test 2: pre vs 30+ (paired if same subjects exist in both groups)
+      group_30plus_data <- protein_data %>% filter(time_since_vaccination_group == "30+")
+      
+      # Find subjects present in both pre and 30+ groups
+      paired_subjects_pre_30plus <- intersect(pre_data$idnr, group_30plus_data$idnr)
+      protein_results$n_paired_pre_30plus <- length(paired_subjects_pre_30plus)
+      
+      if(length(paired_subjects_pre_30plus) >= 5) {  # Minimum 5 pairs for meaningful paired test
+        # Paired t-test
+        pre_paired <- pre_data %>% filter(idnr %in% paired_subjects_pre_30plus) %>% arrange(idnr)
+        group_30plus_paired <- group_30plus_data %>% filter(idnr %in% paired_subjects_pre_30plus) %>% arrange(idnr)
+        
+        if(nrow(pre_paired) == nrow(group_30plus_paired)) {
+          test_result <- wilcox.test(pre_paired$npx, group_30plus_paired$npx, paired = TRUE)
+          protein_results$p_value_pre_vs_30plus <- test_result$p.value
+          protein_results$eff_size_pre_vs_30plus <- get_wilcox_effect_size(pre_paired$npx, group_30plus_paired$npx, paired = TRUE) #new
+          protein_results$test_type_pre_30plus = "paired_wilcoxon"
+          
+        } else { #(nrow(pre_data) >= 3 && nrow(group_30plus_data) >= 3) {
+          test_result <- wilcox.test(pre_data$npx, group_30plus_data$npx, paired = FALSE)
+          protein_results$p_value_pre_vs_30plus <- test_result$p.value
+          protein_results$eff_size_pre_vs_30plus <- get_wilcox_effect_size(pre_data$npx, group_30plus_data$npx, paired = FALSE)
+          protein_results$test_type_pre_30plus = "unpaired_wilcoxon"
+          
+          
+        }
+      }
+      
+      # Test 3: 0-30 vs 30+ (unpaired - different subjects)
+      if(nrow(group_0_30_data) >= 3 && nrow(group_30plus_data) >= 3) {
+        #test_result <- t.test(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE)
+        test_result <- wilcox.test(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE)
+        protein_results$p_value_0_30_vs_30plus <- test_result$p.value
+        protein_results$eff_size_0_30_vs_30plus <- get_wilcox_effect_size(group_0_30_data$npx, group_30plus_data$npx, paired = FALSE) #new
+        protein_results$test_type_0_30_30plus = "unpaired_wilcoxon"
+      }
+      
+      results_list[[protein]] <- protein_results
+    }
+    
+    # Combine results
+    all_results <- do.call(rbind, results_list)
+    
+    # Apply FDR correction to each p-value column
+    all_results$p_adj_pre_vs_0_30 <- p.adjust(all_results$p_value_pre_vs_0_30, method = "fdr")
+    all_results$p_adj_pre_vs_30plus <- p.adjust(all_results$p_value_pre_vs_30plus, method = "fdr")
+    all_results$p_adj_0_30_vs_30plus <- p.adjust(all_results$p_value_0_30_vs_30plus, method = "fdr")
+    
+    # Add significance indicators
+    all_results$sig_pre_vs_0_30 <- case_when(
+      all_results$p_adj_pre_vs_0_30 < 0.001 ~ "***",
+      all_results$p_adj_pre_vs_0_30 < 0.01 ~ "**",
+      all_results$p_adj_pre_vs_0_30 < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    all_results$sig_pre_vs_30plus <- case_when(
+      all_results$p_adj_pre_vs_30plus < 0.001 ~ "***",
+      all_results$p_adj_pre_vs_30plus < 0.01 ~ "**",
+      all_results$p_adj_pre_vs_30plus < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    all_results$sig_0_30_vs_30plus <- case_when(
+      all_results$p_adj_0_30_vs_30plus < 0.001 ~ "***",
+      all_results$p_adj_0_30_vs_30plus < 0.01 ~ "**",
+      all_results$p_adj_0_30_vs_30plus < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+    
+    return(all_results)
+  }
+# 
+
+
+create_plots_with_ggsignif_vaccine <- function(proteins_of_interest, data, statistical_results) {
+  
+  # You'll need: install.packages("ggsignif")
+  library(ggsignif)
+  
+  plot_list <- lapply(proteins_of_interest, function(protein) {
+    
+    # Get statistical results for this protein
+    protein_stats <- statistical_results %>% 
+      filter(protein == !!protein)
+    
+    # Prepare plot data
+    plot_data <- data %>% 
+      filter(!cluster_maximum_6prot_omi %in% c("2", "3")) |>
+      mutate(
+        # time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+        time_since_vaccination_group = case_when(
+          time_since_closest_date < 0 ~ "pre",
+          time_since_closest_date >= 0 & time_since_closest_date <= 30 ~ "0-30",
+          time_since_closest_date > 30 ~ "30+"
+        ),
+        time_since_vaccination_group = factor(time_since_vaccination_group, levels = c("pre", "0-30", "30+"))
+      ) %>%
+      pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "npx") %>%
+      filter(assay == protein)
+    
+    # Prepare significance annotations with test info
+    comparisons <- list()
+    annotations <- c()
+    
+    if(!is.na(protein_stats$p_adj_pre_vs_0_30)) {
+      comparisons <- append(comparisons, list(c("pre", "0-30")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_pre_vs_0_30, "\n(", protein_stats$test_type_pre_0_30, ")"
+      ))
+    }
+    
+    if(!is.na(protein_stats$p_adj_pre_vs_30plus)) {
+      comparisons <- append(comparisons, list(c("pre", "30+")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_pre_vs_30plus, "\n(", protein_stats$test_type_pre_30plus, ")"
+      ))
+    }
+    
+    if(!is.na(protein_stats$p_adj_0_30_vs_30plus)) {
+      comparisons <- append(comparisons, list(c("0-30", "30+")))
+      annotations <- c(annotations, paste0(
+        protein_stats$sig_0_30_vs_30plus, "\n(", protein_stats$test_type_0_30_30plus, ")"
+      ))
+    }
+    
+    # 
+    ## Create plot with lines between same subject:
+    p1 <- ggplot(plot_data, aes(x = time_since_vaccination_group, y = npx, group = idnr)) +
+      geom_beeswarm(aes( my_col = time_since_vaccination_group, my_x = time_since_vaccination_group))
+    pb <- ggplot_build(p1)
+    
+    p <- ggplot(pb$data[[1]], aes(x = x, y = y, group = group)) +
+      geom_line(aes(group = group), col = "grey80", alpha = 0.2) +
+      geom_point( aes( color = my_col), size = 3, alpha = 0.6) +
+      theme_classic() +
+      scale_x_discrete() +
+      labs(title = protein, y = "ProtPQN NPX [AU]", x = "Days since closest vaccination", subtitle = "Excluding samples in serocluster 2 and 3 (infected)") +
+      geom_boxplot(aes(x = my_x, y = y, group = my_x), outlier.shape = NA, fill = NA) +
+      scale_color_manual( values = c("grey", "red", "orange")) +
+      guides(color="none")
+    
+    
+    
+    # Add significance brackets if we have comparisons
+    if(length(comparisons) > 0) {
+      p <- p + geom_signif(
+        comparisons = comparisons,
+        annotations = annotations,
+        step_increase = 0.1,
+        textsize = 2.5
+      )
+    }
+    
+    return(p)
+  })
+  
+  names(plot_list) <- proteins_of_interest
+  return(plot_list)
+}
+
+
+time_adjusted_data_si_vaccination <- time_adjusted_data %>%
+  left_join(
+    olink_bamse_protpqn_blank_rm_intnorm_si %>%
+      select(
+        samplename, idnr, sampling_phase, sminet_case, sminet_date,
+        sampling_time, date1, date2, date3
+      ),
+    by = "samplename"
+  ) %>%
+  mutate(
+    sampling_time = as.Date(sampling_time),
+    dose1_date = as.Date(date1),
+    dose2_date = as.Date(date2),
+    dose3_date = as.Date(date3)
+  )
+
+# select pre- and post-vaccine samples per subject
+samples_pre_post <- time_adjusted_data_si_vaccination %>%
+  rowwise() %>%
+  mutate(
+    # Collect dose dates (remove NA)
+    dose_dates = list(na.omit(c(dose1_date, dose2_date, dose3_date))),
+    # Compute min/max safely
+    min_dose_date = if (length(dose_dates) > 0) min(dose_dates) else as.Date(NA),
+    max_dose_date = if (length(dose_dates) > 0) max(dose_dates) else as.Date(NA),
+    # Find the dose date closest in time (absolute difference)
+    closest_dose_date = if (length(dose_dates) > 0) {
+      dose_dates[which.min(abs(as.numeric(sampling_time - dose_dates)))]
+    } else {
+      as.Date(NA)
+    },
+    # Compute time difference (can be negative if before vaccination)
+    time_since_closest_date = as.numeric(sampling_time - closest_dose_date)
+  ) %>%
+  ungroup() %>%
+  group_by(idnr) %>%
+  mutate(
+    # Classify samples as pre- or post-vaccination
+    type = case_when(
+      !is.na(min_dose_date) & sampling_time < min_dose_date ~ "pre",
+      !is.na(min_dose_date) & sampling_time >= min_dose_date ~ "post",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Keep latest pre and earliest post per person
+  group_by(idnr, type) %>%
+  filter(
+    (type == "pre" & sampling_time == max(sampling_time)) |
+      (type == "post" & sampling_time == min(sampling_time))
+  ) %>%
+  ungroup()
+
+# check that we have max two per idnr
+samples_pre_post %>%
+  count(idnr) %>%
+  count(n)
+
+
+
+#proteins_of_interest_tad <- proteins_of_interest[-grep("PKLR|GLOD4|DNPH1", proteins_of_interest )]
+
+
+statistical_results_timeadjust_vaccine <- calculate_protein_stats_vaccine(proteins_of_interest_tad, samples_pre_post)
+enhanced_plots_timeadjust_vaccine <- create_plots_with_ggsignif_vaccine(proteins_of_interest_tad, samples_pre_post, statistical_results_timeadjust_vaccine)
+```
+
+## Histogram plots with time since infection and time since vaccinaiton (Figure 5 b and c):
+
+```{r}
+infected_subj <- time_adjusted_data_si_zscore |>
+  filter(idnr %in% sminet_infected_subjects) %>%
+  mutate(
+    time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+    time_since_sminet_group = case_when(
+      time_since_sminet < 0 ~ "pre",
+      time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+      time_since_sminet > 30 ~ "30+"
+    ),
+    time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30",  "30+"))
+  ) %>%
+  filter(Time_Sample_Dose1 < 0) %>%
+  filter( ! sampling_phase == "Phase 3")
+
+infected_subj <- infected_subj |> 
+  mutate(type = case_when(time_since_sminet < 0 ~ "pre",                                                        time_since_sminet > 0 ~ "post")) |>
+  group_by(idnr, type) %>%
+  filter(
+    (type == "pre" & sampling_time == max(sampling_time)) |
+      (type == "post" & sampling_time == min(sampling_time))
+  ) %>%
+  ungroup() |>
+  # Only keep those idnr where we have one pre and one post sample:
+  group_by(idnr) %>%
+  filter(all(c("pre", "post") %in% type)) %>%
+  ungroup()
+
+## Take out vaccinated:
+time_adjusted_data_si_zscore_vaccination <- time_adjusted_data_si_zscore %>%
+  left_join(
+    olink_bamse_protpqn_blank_rm_intnorm_si %>%
+      select(
+        samplename,
+        date1, date2, date3
+      ),
+    by = "samplename"
+  ) %>%
+  mutate(
+    sampling_time = as.Date(sampling_time),
+    dose1_date = as.Date(date1),
+    dose2_date = as.Date(date2),
+    dose3_date = as.Date(date3)
+  )
+
+which.min.pos <- function(x) {
+  if (all(x < 0)) return(which.max(x))
+  
+  min_value <- min(x[x >= 0])
+  which(x == min_value)
+}
+
+# select pre- and post-vaccine samples per subject
+samples_pre_post <- time_adjusted_data_si_zscore_vaccination %>%
+  rowwise() %>%
+  mutate(
+    # Collect dose dates (remove NA)
+    dose_dates = list(na.omit(c(dose1_date, dose2_date, dose3_date))),
+    # Compute min/max safely
+    min_dose_date = if (length(dose_dates) > 0) min(dose_dates) else as.Date(NA),
+    max_dose_date = if (length(dose_dates) > 0) max(dose_dates) else as.Date(NA),
+    # Find the dose date closest in time (absolute difference)
+    closest_dose_date = if (length(dose_dates) > 0) {
+      dose_dates[which.min.pos(as.numeric(sampling_time - dose_dates))]
+    } else {
+      as.Date(NA)
+    },
+    # Compute time difference (can be negative if before vaccination)
+    time_since_closest_date = as.numeric(sampling_time - closest_dose_date)
+  ) %>%
+  ungroup() %>%
+  group_by(idnr) %>%
+  mutate(
+    # Classify samples as pre- or post-vaccination
+    type = case_when(
+      !is.na(min_dose_date) & sampling_time < min_dose_date ~ "pre",
+      !is.na(min_dose_date) & sampling_time >= min_dose_date ~ "post",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Keep latest pre and earliest post per person
+  group_by(idnr, type) %>%
+  filter(
+    (type == "pre" & sampling_time == max(sampling_time)) |
+      (type == "post" & sampling_time == min(sampling_time))
+  ) %>%
+  ungroup() |>
+  # Only keep those idnr where we have one pre and one post sample:
+  group_by(idnr) %>%
+  filter(all(c("pre", "post") %in% type)) %>%
+  ungroup()
+
+
+# Prepare plot data
+vaccinated_samples <- samples_pre_post %>% 
+  filter(!cluster_maximum_6prot_omi %in% c("2", "3")) |>
+  # Make sure we only keep those idnr where we have one pre and one post sample:
+  group_by(idnr) %>%
+  filter(all(c("pre", "post") %in% type)) %>%
+  ungroup()
+
+
+### Merge and data frames:
+infected_subj_merge <- infected_subj |> select(samplename, time_since_sminet, type) |> mutate( time_since_event = time_since_sminet, event = "Infection") |> select( !time_since_sminet)
+
+vaccinated_samples_merge <- vaccinated_samples |> select(samplename, time_since_closest_date, type) |> mutate( time_since_event = time_since_closest_date, event = "Closest vaccination") |> select( !time_since_closest_date)
+
+event_merge <- rbind(infected_subj_merge, vaccinated_samples_merge)
+
+
+## Plot the histogram
+event_means <- event_merge %>%
+  group_by(event) %>%
+  summarise(mean_time = mean(time_since_event, na.rm = TRUE))
+
+
+plot1 <- ggplot(event_merge, aes(x = time_since_event, fill = event)) +
+  geom_histogram(alpha = 0.6) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.4) +
+  theme_classic() +
+  labs(x = "Time since event") +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  theme(
+    axis.title.x = element_text(size = 16),
+    axis.text.x = element_text(size = 14),
+    axis.title.y = element_text(size = 16),
+    axis.text.y = element_text(size = 14),
+    legend.text = element_text(size=14))
+
+event_merge_post_only <- event_merge |> filter( time_since_event >= 0)
+
+event_means <- event_merge_post_only %>%
+  group_by(event) %>%
+  summarise(mean_time = mean(time_since_event, na.rm = TRUE))
+
+plot2 <- ggplot(event_merge_post_only, aes(x = time_since_event, fill = event)) +
+  geom_histogram(alpha = 0.6) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.4) +
+  theme_classic() +
+  labs(x = "Time since event") +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  theme(
+    axis.title.x = element_text(size = 16),
+    axis.text.x = element_text(size = 14),
+    axis.title.y = element_text(size = 16),
+    axis.text.y = element_text(size = 14),
+    legend.text = element_text(size=14))
+
+```
+
+### Protein levels in Z-score over time (Figure 5d-g):
+
+```{r}
+
+### Z scores:
+protein_since_infection_zscore <- function(proteins_of_interest, data) {
+  
+  plot_list <- lapply(proteins_of_interest, function(protein) {
+    
+    # Prepare plot data
+    plot_data <- data %>% 
+      filter(idnr %in% sminet_infected_subjects) %>%
+      mutate(
+        time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date),
+        time_since_sminet_group = case_when(
+          time_since_sminet < 0 ~ "pre",
+          time_since_sminet >= 0 & time_since_sminet <= 30 ~ "0-30",
+          time_since_sminet > 30 ~ "30+"
+        ),
+        time_since_sminet_group = factor(time_since_sminet_group, levels = c("pre", "0-30",  "30+"))
+      ) %>%
+      filter(Time_Sample_Dose1 < 0) %>%
+      #  filter( ! sampling_phase == "Phase 3") |>
+      pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "z_score") %>%
+      filter(assay == protein)
+    
+    plot_data <- plot_data |> 
+      mutate(type = case_when(time_since_sminet < 0 ~ "pre",                                                        time_since_sminet > 0 ~ "post")) |>
+      group_by(idnr, type) %>%
+      filter(
+        (type == "pre" & sampling_time == max(sampling_time)) |
+          (type == "post" & sampling_time == min(sampling_time))
+      ) %>%
+      ungroup() |>
+      # Make sure we only keep those idnr where we have one pre and one post sample:
+      group_by(idnr) %>%
+      filter(all(c("pre", "post") %in% type)) %>%
+      ungroup()
+    
+    
+    ymax <- max(abs(c(min(plot_data$z_score, na.rm=TRUE),
+                      max(plot_data$z_score, na.rm=TRUE))))
+    y_limits <- c(-ymax, ymax)
+    
+    p <- ggplot(plot_data, aes(x = as.numeric(time_since_sminet), y = z_score, fill = z_score)) +
+      geom_point(color = "black", shape = 21, size = 3 ) +
+      #scale_fill_viridis(breaks = scales::pretty_breaks(n = 8)) +
+      scale_fill_gradient2(
+        low = "#09287d",
+        mid = "white",
+        high = "#7d0916",
+        midpoint = 0,
+        name = "Z-score"
+      ) +
+      #      scale_fill_steps2(high = "red", low = "blue", limits = c(-5, 5), midpoint = 0, breaks = c(-3, -2, 2, 3), labels = c("< -3", "-2", "2", ">3")) +
+      geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1) +
+      geom_hline( yintercept = 0, linetype = "dotdash", color = "black", linewidth = 1) +
+      geom_hline( yintercept = 2, linetype = "dotted", color = "black", linewidth = 1) +
+      geom_hline( yintercept = -2, linetype = "dotted", color = "black", linewidth = 1) +
+      theme_classic() +
+      labs(
+        title = protein,
+        subtitle = "Subjects with PCR+ confirmed infection, no vaccination",
+        y = "Z score",
+        x = "Days since PCR+"
+      ) +
+      guides(color = "none") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 10),
+                         limits = y_limits) +
+      theme(
+        axis.title.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        axis.text.y = element_text(size = 14),
+        legend.text = element_text(size=14))
+    
+    
+    p1 <- ggplot(plot_data, aes( x = as.factor(1), y = z_score)) +
+      #geom_boxplot(color = "black", size = 1, outlier.shape = NA) +
+      geom_quasirandom( aes(col = z_score), size = 2) +
+      geom_boxplot(color = "black", size = 1, outlier.shape = NA, alpha = 0, width=0.2) +
+      theme(axis.title.x=element_blank(),
+            axis.text.x=element_blank(),
+            axis.ticks.x=element_blank()) +
+      scale_color_gradient2(
+        low = "#09287d",
+        mid = "white",
+        high = "#7d0916",
+        midpoint = 0,
+        name = "Z-score"
+      )  +
+      theme_classic() +
+      #scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 10),
+                         limits = y_limits) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        axis.text.y = element_text(size = 14),
+        legend.text = element_text(size=14)
+      )
+    
+    plot_comb <- p1 + p + plot_layout(guides = "collect", design = "
+ABB")
+    
+    return(plot_comb)
+    
+  })
+  names(plot_list) <- proteins_of_interest
+  return(plot_list)
+  
+}
+
+
+protein_since_infection_all_zscore <- function(proteins_of_interest, data) {
+  
+  plot_list <- lapply(proteins_of_interest, function(protein) {
+    
+    # Prepare plot data
+    plot_data <- data %>% 
+      filter(idnr %in% sminet_infected_subjects) %>%
+      mutate(
+        time_since_sminet = as.Date(sampling_time) - as.Date(sminet_date)
+      ) %>%
+      pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "z_score") %>%
+      filter(assay == protein)
+    
+    ymax <- max(abs(c(min(plot_data$z_score, na.rm=TRUE),
+                      max(plot_data$z_score, na.rm=TRUE))))
+    y_limits <- c(-ymax, ymax)
+    
+    p <- ggplot(plot_data, aes(x = as.numeric(time_since_sminet), y = z_score, fill = z_score)) +
+      geom_point(color = "black", shape = 21, size = 3 ) +
+      scale_fill_gradient2(
+        low = "#09287d",
+        mid = "white",
+        high = "#7d0916",
+        midpoint = 0,
+        name = "Z-score"
+      ) +
+      #      scale_fill_steps2(high = "red", low = "blue", limits = c(-5, 5), midpoint = 0, breaks = c(-3, -2, 2, 3), labels = c("< -3", "-2", "2", ">3")) +
+      geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1) +
+      geom_hline( yintercept = 0, linetype = "dotdash", color = "black", linewidth = 1) +
+      geom_hline( yintercept = 2, linetype = "dotted", color = "black", linewidth = 1) +
+      geom_hline( yintercept = -2, linetype = "dotted", color = "black", linewidth = 1) +
+      theme_classic() +
+      labs(
+        title = protein,
+        subtitle = "Subjects with PCR+ confirmed infection and possibly vaccinated subjects",
+        y = "Z scores",
+        x = "Days since PCR+"
+      ) +
+      guides(color = "none") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 10),
+                         limits = y_limits)
+    
+    
+    
+    p1 <- ggplot(plot_data, aes( x = as.factor(1), y = z_score)) +
+      #geom_boxplot(color = "black", size = 1, outlier.shape = NA) +
+      geom_quasirandom( aes(col = z_score), size = 2) +
+      geom_boxplot(color = "black", size = 1, outlier.shape = NA, alpha = 0, width=0.2) +
+      theme(axis.title.x=element_blank(),
+            axis.text.x=element_blank(),
+            axis.ticks.x=element_blank()) +
+      scale_color_gradient2(
+        low = "#09287d",
+        mid = "white",
+        high = "#7d0916",
+        midpoint = 0,
+        name = "Z-score"
+      )  +
+      theme_classic() +
+      #scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 10),
+                         limits = y_limits) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.text = element_text(size=14)
+      )
+    
+    plot_comb <- p1 + p + plot_layout(guides = "collect", design = "
+ABB")
+    
+    return(plot_comb)
+    
+  })
+  names(plot_list) <- proteins_of_interest
+  return(plot_list)
+  
+}
+
+## z-score transformation:
+time_adjusted_data_si_zscore <- time_adjusted_data_si %>%
+  mutate(
+    across(
+      all_of(proteins_of_interest_tad),
+      ~ ( . - mean(., na.rm = TRUE) ) / sd(., na.rm = TRUE)
+    )
+  )
+
+plots_zscores_I <- protein_since_infection_zscore(proteins_of_interest_tad, time_adjusted_data_si_zscore)
+
+plots_zscores_VI <- protein_since_infection_all_zscore(proteins_of_interest_tad, time_adjusted_data_si_zscore)
+
+
+#### Vaccinated people only
+
+time_adjusted_data_si_zscore_vaccination <- time_adjusted_data_si_zscore %>%
+  left_join(
+    olink_bamse_protpqn_blank_rm_intnorm_si %>%
+      select(
+        samplename,
+        date1, date2, date3
+      ),
+    by = "samplename"
+  ) %>%
+  mutate(
+    sampling_time = as.Date(sampling_time),
+    dose1_date = as.Date(date1),
+    dose2_date = as.Date(date2),
+    dose3_date = as.Date(date3)
+  )
+
+which.min.pos <- function(x) {
+  if (all(x < 0)) return(which.max(x))
+  
+  min_value <- min(x[x >= 0])
+  which(x == min_value)
+}
+
+# select pre- and post-vaccine samples per subject
+samples_pre_post <- time_adjusted_data_si_zscore_vaccination %>%
+  rowwise() %>%
+  mutate(
+    # Collect dose dates (remove NA)
+    dose_dates = list(na.omit(c(dose1_date, dose2_date, dose3_date))),
+    # Compute min/max safely
+    min_dose_date = if (length(dose_dates) > 0) min(dose_dates) else as.Date(NA),
+    max_dose_date = if (length(dose_dates) > 0) max(dose_dates) else as.Date(NA),
+    # Find the dose date closest in time (absolute difference)
+    closest_dose_date = if (length(dose_dates) > 0) {
+      dose_dates[which.min.pos(as.numeric(sampling_time - dose_dates))]
+    } else {
+      as.Date(NA)
+    },
+    # Compute time difference (can be negative if before vaccination)
+    time_since_closest_date = as.numeric(sampling_time - closest_dose_date)
+  ) %>%
+  ungroup() %>%
+  group_by(idnr) %>%
+  mutate(
+    # Classify samples as pre- or post-vaccination
+    type = case_when(
+      !is.na(min_dose_date) & sampling_time < min_dose_date ~ "pre",
+      !is.na(min_dose_date) & sampling_time >= min_dose_date ~ "post",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Keep latest pre and earliest post per person
+  group_by(idnr, type) %>%
+  filter(
+    (type == "pre" & sampling_time == max(sampling_time)) |
+      (type == "post" & sampling_time == min(sampling_time))
+  ) %>%
+  ungroup() |>
+  # Make sure we only keep those idnr where we have one pre and one post sample:
+  group_by(idnr) %>%
+  filter(all(c("pre", "post") %in% type)) %>%
+  ungroup()
+
+# check that we have max two per idnr
+samples_pre_post %>%
+  count(idnr) %>%
+  count(n)
+
+protein_since_vaccination_zcore <- function(proteins_of_interest, data) {
+  
+  plot_list <- lapply(proteins_of_interest, function(protein) {
+    
+    # Prepare plot data
+    plot_data <- data %>% 
+      filter(!cluster_maximum_6prot_omi %in% c("2", "3")) |>
+      pivot_longer(cols = all_of(proteins_of_interest), names_to = "assay", values_to = "z_score") %>%
+      # group_by(assay) %>%
+      #    mutate(
+      #      z_score = (npx - mean(npx, na.rm = TRUE)) / sd(npx, na.rm = TRUE)
+      #    ) %>%
+      filter(assay == protein) |>
+      # Make sure we only keep those idnr where we have one pre and one post sample:
+      group_by(idnr) %>%
+      filter(all(c("pre", "post") %in% type)) %>%
+      ungroup()
+    
+    # # Prepare significance 
+    ymax <- max(abs(c(min(plot_data$z_score, na.rm=TRUE),
+                      max(plot_data$z_score, na.rm=TRUE))))
+    y_limits <- c(-ymax, ymax)
+    
+    
+    p <- ggplot(plot_data, aes(x = as.numeric(time_since_closest_date), y = z_score, fill = z_score)) +
+      geom_point(color = "black", shape = 21, size = 3 ) +
+      scale_fill_gradient2(
+        low = "#09287d",
+        mid = "white",
+        high = "#7d0916",
+        midpoint = 0,
+        name = "Z-score"
+      )  +
+      #scale_fill_steps2(high = "red", low = "blue", limits = c(-5, 5), midpoint = 0, breaks = c(-3, -2, 2, 3), labels = c("< -3", "-2", "2", ">3")) +
+      #                 scale_fill_gradient2(
+      #   low = "#4575B4",
+      #   mid = "white",
+      #   high = "#D73027",
+      #   midpoint = 0,
+      #   name = "Z-score"
+      # )+
+      #scale_fill_viridis(breaks = scales::pretty_breaks(n = 8)) +
+      geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1) +
+      geom_hline( yintercept = 0, linetype = "dotdash", color = "black", linewidth = 1) +
+      geom_hline( yintercept = 2, linetype = "dotted", color = "black", linewidth = 1) +
+      geom_hline( yintercept = -2, linetype = "dotted", color = "black", linewidth = 1) +
+      theme_classic() +
+      labs(
+        title = protein,
+        subtitle = "Excluding samples in serocluster 2 and 3 (infected)",
+        y = "Z-score",
+        x = "Days since closest vaccination"
+      ) +
+      # guides(color = "none") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 10),
+                         limits = y_limits) +
+      theme(
+        axis.title.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        axis.text.y = element_text(size = 14),
+        legend.text = element_text(size=14))
+    
+    
+    p1 <- ggplot(plot_data, aes( x = as.factor(1), y = z_score)) +
+      #geom_boxplot(color = "black", size = 1, outlier.shape = NA) +
+      geom_quasirandom( aes(col = z_score), size = 2) +
+      geom_boxplot(color = "black", size = 1, outlier.shape = NA, alpha = 0, width=0.2) +
+      theme(axis.title.x=element_blank(),
+            axis.text.x=element_blank(),
+            axis.ticks.x=element_blank()) +
+      scale_color_gradient2(
+        low = "#09287d",
+        mid = "white",
+        high = "#7d0916",
+        midpoint = 0,
+        name = "Z-score"
+      )  +
+      theme_classic() +
+      #scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 10),
+                         limits = y_limits) +
+      theme(
+        axis.title.x = element_blank(),
+        #axis.text.x = element_text(size = 14),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        axis.ticks.x = element_blank(),
+        legend.text = element_text(size=14)
+      )
+    
+    plot_comb <- p1 + p + plot_layout(guides = "collect", design = "
+ABB")
+    
+    return(plot_comb)
+    
+    
+    
+  })
+  names(plot_list) <- proteins_of_interest
+  return(plot_list)
+  
+}
+
+plots_zscores_V <- protein_since_vaccination_zcore(proteins_of_interest_tad, samples_pre_post)
+
+
+
+
+
+plot_list <- lapply( 1:length(proteins_of_interest_tad), function( n){
+  
+  protein <- proteins_of_interest_tad[n]
+  
+  # Combine the z-score values across both datasets
+  combined_z_limits <- range(
+    time_adjusted_data_si_zscore[protein],
+    na.rm = TRUE
+  )
+  
+  # Optionally, extend slightly for nicer color distribution
+  combined_z_limits[1] <- floor(combined_z_limits[1])
+  combined_z_limits[2] <- ceiling(combined_z_limits[2])
+  
+  
+  # Update the fill aesthetic mapping to use z_bin instead of z_score
+  plots_zscores_I[[n]]$mapping$fill <- aes(fill = z_score)$fill
+  plots_zscores_V[[n]]$mapping$fill <- aes(fill = z_score)$fill
+  
+  p_I <- plots_zscores_I[[n]]
+  p_V <- plots_zscores_V[[n]]
+  
+  
+  (wrap_plots(p_I) + wrap_plots(p_V)) +
+    plot_layout(guides = "collect") &
+    scale_y_continuous(limits = combined_z_limits)
+  
+})
+
+```
+
+### Comparing proteins in relation to infection and vaccination (Fig. S19):
+
+```{r}
+
+# Comparing protein levels in previously infected versus seronegative subjects (Fig. S19a): 
+#  COMPARE 11 and 22 at baseline:
+n_runs <- 100
+fdr_cutoff <- 0.05
+seed_base <- 123
+
+library(dplyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(progress)
+
+# Precompute group sizes
+n12 <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 3", clust_traj12 == "22") %>%
+  distinct(idnr) %>%
+  nrow()
+
+# Get random IDs in group 11
+group11_ids <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 3", clust_traj12 == "11") %>%
+  distinct(idnr) %>%
+  pull(idnr)
+
+# Function for bootstrap iteration
+run_one_bootstrap_within_phase <- function(i) {
+  set.seed(seed_base + i)
+  
+  # randomly sample n12 subjects from group11 (WITH replacement for bootstrap)
+  sampled_11 <- sample(group11_ids, size = n12, replace = TRUE)
+  
+  # build data_list for analysis: keep group12 and the sampled group11 subjects
+  data_subset <- time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 3") %>%
+    filter(clust_traj12 == "22" | idnr %in% sampled_11)
+  
+  data_list <- list(
+    values = data_subset %>%
+      dplyr::select(sample_id, all_of(olink_proteins_ta)),     # adjust variable name if needed
+    sinfo = data_subset %>%
+      dplyr::select(idnr, sample_id, sampling_phase, clust_traj12, male)
+  )
+  
+  # Run the delta-delta analysis (difference in change between Phase1 and Phase2 for each group)
+  lm_dd <- lm_analysis(
+    data_list,
+    "sample_id",
+    predictor = "clust_traj12",
+    covar = "male",
+    stratify_by = "sampling_phase"
+    # difference_col = "sampling_phase",
+    #  individual_id = "idnr",
+    # differences_between = c("Phase 1", "Phase 2")
+  )
+  
+  # lm_dd$results expected to be a data.frame with columns: assay, estimate, p_value, fdr
+  res <- lm_dd$results %>%
+    mutate(iter = i) %>%
+    dplyr::select(assay, sampling_phase, median_diff, estimate, p_value, fdr, iter)
+  
+  # Return list of significant assays this run
+  sig_assays_p1 <- res %>%filter(sampling_phase == "Phase 1") %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  sig_assays_p2 <- res %>%filter(sampling_phase == "Phase 2") %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  list(results = res, significant_p1 = sig_assays_p1, significant_p2 = sig_assays_p2)
+}
+
+# Run many iterations (serial)
+pb <- progress_bar$new(total = n_runs)
+all_iter_results <- vector("list", n_runs)
+for (i in seq_len(n_runs)) {
+  iter_out <- tryCatch({
+    out <- run_one_bootstrap_within_phase(i)
+    pb$tick()
+    out
+  }, error = function(e) {
+    pb$tick()
+    message("Error in iteration ", i, ": ", e$message)
+    list(results = tibble(assay = character(), median_diff = numeric(), estimate = numeric(), p_value = numeric(), fdr = numeric(), iter = integer()),
+         significant_p1 = character(0),
+         significant_p2 = character(0))
+  })
+  all_iter_results[[i]] <- iter_out
+}
+
+# Aggregate outputs
+# Frequency table: how many times each assay was significant
+all_sig_lists_p1 <- map(all_iter_results, "significant_p1")
+all_sig_flat_p1 <- unlist(all_sig_lists_p1)
+protein_counts <- sort(table(all_sig_flat_p1), decreasing = TRUE)
+protein_counts_p1_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+
+all_sig_lists_p2 <- map(all_iter_results, "significant_p2")
+all_sig_flat_p2 <- unlist(all_sig_lists_p2)
+protein_counts <- sort(table(all_sig_flat_p2), decreasing = TRUE)
+protein_counts_p2_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+# Collect all per-iteration results (estimates, p-values)
+all_results_df <- all_iter_results %>%
+  map("results") %>%
+  list_rbind()
+
+# Compute summary statistics and 95% confidence intervals per assay
+summary_df <- all_results_df %>%
+  group_by(sampling_phase, assay) %>%
+  summarise(
+    median_median_diff = median( median_diff, na.rm = TRUE),
+    median_estimate = median(estimate, na.rm = TRUE),
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    lower_95 = quantile(estimate, 0.025, na.rm = TRUE),
+    upper_95 = quantile(estimate, 0.975, na.rm = TRUE),
+    prop_pos = mean(estimate > 0, na.rm = TRUE),
+    prop_neg = mean(estimate < 0, na.rm = TRUE),
+    prop_sig = mean(fdr < fdr_cutoff, na.rm = TRUE),
+    n_non_na = sum(!is.na(estimate)),
+    fdr_median = median(fdr),
+    fdr_mean = mean(fdr),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(prop_sig), desc(prop_pos))
+
+summary_df_1122 <- summary_df
+
+### Plot Volcano plot:
+volcano_1122_baseline <- ggplot(summary_df_1122, aes( x = median_median_diff, y = -log10(fdr_median))) +
+  geom_point( aes( color = prop_sig, size = prop_sig)) +
+  facet_wrap(~sampling_phase) +
+  theme_classic() +
+  #theme_bw() +
+  geom_text_repel(
+    data = subset(summary_df_1122, prop_sig > 0.1),
+    aes(label = str_remove(assay, "_Phase \\d")),  # Use the `protein` column as the label
+    color = "black",
+    box.padding = 0.5,
+    max.overlaps = Inf
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  #colr_scale +
+  scale_x_continuous(limits = center_limits()) +
+  scale_color_gradientn(
+    colors = c("grey80", wes_palette("Zissou1", 100, type = "continuous")),
+    values = scales::rescale(c(0, 0.0001, 1)),  # Grey for 0, then gradient starts
+    limits = c(0, 1),
+    name = "Proportion\nsignificant"
+  ) +
+  scale_y_continuous(breaks = round(seq(0, max(-log10(summary_df$fdr_median)+2), by = 1),1)) +
+  labs(
+    title = "Subjects who were infected in phase 2 vs naive",
+    subtitle = "Bootstrapping naive group for 100 iterations",
+    x = "Median difference between groups",
+    y = "-log10(FDR)"
+  ) +
+  geom_vline( xintercept = 0, linetype = "dashed", color = "grey") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+#---------------------------------------------------------------------------------------------------------
+# Comparing protein levels in previously infected versus newly infected subjects (Fig. S19b):  
+
+# 1 -> 2 vs 2 -> 2
+data_list_12_22 <- list(
+  values = time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 3") %>%
+    filter(clust_traj12 %in% c("12", "22")) %>%
+    dplyr::select(sample_id, !!olink_proteins_ta),
+  
+  sinfo = time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 3") %>%
+    filter(clust_traj12 %in% c("12", "22")) %>%
+    dplyr::select(idnr, sample_id, sampling_phase, clust_traj12, male)
+)
+
+# lm between 12 and 22 at each sampling phase
+lm_12_22 <- lm_analysis(data_list_12_22, "sample_id", predictor = "clust_traj12", covar = "male",
+                        stratify_by = "sampling_phase")
+
+plts_12_22 <- plot_lm_results(lm_12_22, sep_by_colr = F)
+
+plts_12_22$volcano
+
+
+#---------------------------------------------------------------------------------------------------------
+# Comparing protein levels in previously infected who get vaccinated versus newly infected AND vaccinated subjects (Fig. S19c): 
+
+# between phase 2 and 3, cluster 1 -> 3 and 2 -> 3
+data_list_13_23 <- list(
+  values = time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 1") %>%
+    filter(clust_traj23 %in% c("13", "23")) %>%
+    dplyr::select(sample_id, !!olink_proteins_ta),
+  
+  sinfo = time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 1") %>%
+    filter(clust_traj23 %in% c("13", "23")) %>%
+    dplyr::select(idnr, sample_id, sampling_phase, clust_traj23, male)
+)
+
+# lm between 13 and 23 at each sampling phase
+lm_13_23 <- lm_analysis(data_list_13_23, "sample_id", predictor = "clust_traj23", covar = "male",
+                        stratify_by = "sampling_phase")
+
+plts_13_23 <- plot_lm_results(lm_13_23, sep_by_colr = F)
+
+plts_13_23$volcano
+
+
+#---------------------------------------------------------------------------------------------------------
+# Previously infected subjects with waning anti-N antibodies who became vaccinated prior to Phase 3 (Fig. S19d):
+# 14 and 24 groups at baseline each phase
+
+n_runs <- 100
+fdr_cutoff <- 0.05
+seed_base <- 123
+
+library(dplyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(progress)
+
+# Precompute group sizes
+n24 <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 1", clust_traj23 == "24") %>%
+  distinct(idnr) %>%
+  nrow()
+
+# Get random IDs in group 11
+group14_ids <- time_adjusted_data_for_lm %>%
+  filter(sampling_phase != "Phase 1", clust_traj23 == "14") %>%
+  distinct(idnr) %>%
+  pull(idnr)
+
+
+# Function for bootstrap iteration
+run_one_bootstrap_within_phase <- function(i) {
+  set.seed(seed_base + i)
+  
+  # randomly sample n12 subjects from group11 (WITH replacement for bootstrap)
+  sampled_11 <- sample(group14_ids, size = n24, replace = TRUE)
+  
+  # build data_list for analysis: keep group12 and the sampled group11 subjects
+  data_subset <- time_adjusted_data_for_lm %>%
+    filter(sampling_phase != "Phase 1") %>%
+    filter(clust_traj23 == "24" | idnr %in% sampled_11)
+  
+  data_list <- list(
+    values = data_subset %>%
+      dplyr::select(sample_id, all_of(olink_proteins_ta)),     # adjust variable name if needed
+    sinfo = data_subset %>%
+      dplyr::select(idnr, sample_id, sampling_phase, clust_traj23, male)
+  )
+  
+  # Run the delta-delta analysis (difference in change between Phase1 and Phase2 for each group)
+  lm_dd <- lm_analysis(
+    data_list,
+    "sample_id",
+    predictor = "clust_traj23",
+    covar = "male",
+    stratify_by = "sampling_phase"
+  )
+  
+  # lm_dd$results expected to be a data.frame with columns: assay, estimate, p_value, fdr
+  res <- lm_dd$results %>%
+    mutate(iter = i) %>%
+    dplyr::select(assay, sampling_phase, median_diff, estimate, p_value, fdr, iter)
+  
+  # Return list of significant assays this run
+  sig_assays_p2 <- res %>%filter(sampling_phase == "Phase 2") %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  sig_assays_p3 <- res %>%filter(sampling_phase == "Phase 3") %>% filter(fdr < fdr_cutoff) %>% pull(assay)
+  
+  list(results = res, significant_p2 = sig_assays_p2, significant_p3 = sig_assays_p3)
+}
+
+# Run many iterations (serial)
+pb <- progress_bar$new(total = n_runs)
+all_iter_results <- vector("list", n_runs)
+for (i in seq_len(n_runs)) {
+  iter_out <- tryCatch({
+    out <- run_one_bootstrap_within_phase(i)
+    pb$tick()
+    out
+  }, error = function(e) {
+    pb$tick()
+    message("Error in iteration ", i, ": ", e$message)
+    list(results = tibble(assay = character(), median_diff = numeric(), estimate = numeric(), p_value = numeric(), fdr = numeric(), iter = integer()),
+         significant_p2 = character(0),
+         significant_p3 = character(0))
+  })
+  all_iter_results[[i]] <- iter_out
+}
+
+# Aggregate outputs
+# Frequency table: how many times each assay was significant
+all_sig_lists_p2 <- map(all_iter_results, "significant_p2")
+all_sig_flat_p2 <- unlist(all_sig_lists_p2)
+protein_counts <- sort(table(all_sig_flat_p2), decreasing = TRUE)
+protein_counts_p2_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+
+all_sig_lists_p3 <- map(all_iter_results, "significant_p3")
+all_sig_flat_p3 <- unlist(all_sig_lists_p3)
+protein_counts <- sort(table(all_sig_flat_p3), decreasing = TRUE)
+protein_counts_p3_df <- tibble(
+  assay = names(protein_counts),
+  count = as.integer(protein_counts),
+  freq = count / n_runs
+)
+
+
+
+# Collect all per-iteration results (estimates, p-values)
+all_results_df <- all_iter_results %>%
+  map("results") %>%
+  list_rbind()
+
+# Compute summary statistics and 95% confidence intervals per assay
+summary_df <- all_results_df %>%
+  group_by(sampling_phase, assay) %>%
+  summarise(
+    median_median_diff = median( median_diff, na.rm = TRUE),
+    median_estimate = median(estimate, na.rm = TRUE),
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    lower_95 = quantile(estimate, 0.025, na.rm = TRUE),
+    upper_95 = quantile(estimate, 0.975, na.rm = TRUE),
+    prop_pos = mean(estimate > 0, na.rm = TRUE),
+    prop_neg = mean(estimate < 0, na.rm = TRUE),
+    prop_sig = mean(fdr < fdr_cutoff, na.rm = TRUE),
+    n_non_na = sum(!is.na(estimate)),
+    fdr_median = median(fdr),
+    fdr_mean = mean(fdr),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(prop_sig), desc(prop_pos))
+
+
+summary_df_2414 <- summary_df
+
+### Plot Volcano plot:
+volcano_2414_baseline <- ggplot(summary_df_2414, aes( x = median_median_diff, y = -log10(fdr_median))) +
+  geom_point( aes( color = prop_sig, size = prop_sig)) +
+  facet_wrap(~sampling_phase) +
+  theme_classic() +
+  #theme_bw() +
+  geom_text_repel(
+    data = subset(summary_df_2414, prop_sig > 0.1),
+    aes(label = str_remove(assay, "_Phase \\d")),  # Use the `protein` column as the label
+    color = "black",
+    box.padding = 0.5,
+    max.overlaps = Inf
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  #colr_scale +
+  scale_x_continuous(limits = center_limits()) +
+  scale_color_gradientn(
+    colors = c("grey80", wes_palette("Zissou1", 100, type = "continuous")),
+    values = scales::rescale(c(0, 0.0001, 1)),  # Grey for 0, then gradient starts
+    limits = c(0, 1),
+    name = "Proportion\nsignificant"
+  ) +
+  #scale_y_continuous(breaks = round(seq(0, max(-log10(summary_df$fdr_median)+2), by = 1),1)) +
+  scale_y_continuous(limits = c(0, 6), breaks = round(seq(0, 6, by = 1),1)) +
+  labs(
+    title = "Subjects who were previously infected vs naive who got vaccinated",
+    subtitle = "Bootstrapping naive group for 100 iterations",
+    x = "Median difference between groups",
+    y = "-log10(FDR)"
+  ) +
+  geom_vline( xintercept = 0, linetype = "dashed", color = "grey") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+#---------------------------------------------------------------------------------------------------------
+# Protein levels between phases for different cluster changing groups (S19e-h):
+
+## 1-> 2 vs 2-2:
+lap3_12_vs_22 <- left_join( data_list_12_22$values, data_list_12_22$sinfo, by = "sample_id") |>
+  ggplot( aes( y = LAP3, x = sampling_phase)) +
+  geom_line(aes(group = idnr), alpha = 0.3, color = "grey80") +
+  geom_quasirandom(alpha = 0.7, size = 1.5, color = "grey60") +
+  #geom_beeswarm(alpha = 0.5, size = 3, color = "grey70") +
+  geom_boxplot( fill = NA, outlier.shape = NA) +
+  facet_wrap( ~ clust_traj12) +
+  theme_classic(12) +
+  stat_compare_means( size = 2.1) +
+  labs( y = "NPX [AU]", x = "sampling phase", title = "LAP3") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 8))
+
+
+LGALS9_12_vs_22 <- left_join( data_list_12_22$values, data_list_12_22$sinfo, by = "sample_id") |>
+  ggplot( aes( y = LGALS9, x = sampling_phase)) +
+  geom_line(aes(group = idnr), alpha = 0.3, color = "grey80") +
+  geom_quasirandom(alpha = 0.7, size = 1.5, color = "grey60") +
+  #geom_beeswarm(alpha = 0.5, size = 3, color = "grey70") +
+  geom_boxplot( fill = NA, outlier.shape = NA) +
+  facet_wrap( ~ clust_traj12) +
+  theme_classic(12) +
+  stat_compare_means( size = 2.1) +
+  labs( y = "NPX [AU]", x = "sampling phase", title = "LGALS9") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 8))
+
+traf2_12_vs_22 <- left_join( data_list_12_22$values, data_list_12_22$sinfo, by = "sample_id") |>
+  ggplot( aes( y = TRAF2, x = sampling_phase)) +
+  #geom_beeswarm(alpha = 0.5, size = 3, color = "grey70") +
+  geom_line(aes(group = idnr), alpha = 0.3, color = "grey80") +
+  geom_quasirandom(alpha = 0.7, size = 1.5, color = "grey60") +
+  geom_boxplot( fill = NA, outlier.shape = NA) +
+  facet_wrap( ~ clust_traj12) +
+  theme_classic(12) +
+  stat_compare_means( size = 2.1) +
+  labs( y = "NPX [AU]", x = "sampling phase", title = "TRAF2") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 8))
+
+## 1-3 vs 2-3:
+lap3_13_vs_23 <- left_join( data_list_13_23$values, data_list_13_23$sinfo, by = "sample_id") |>
+  ggplot( aes( y = LAP3, x = sampling_phase)) +
+  geom_line(aes(group = idnr), alpha = 0.3, color = "grey80") +
+  geom_quasirandom(alpha = 0.7, size = 1.5, color = "grey60") +
+  #geom_beeswarm(alpha = 0.5, size = 3, color = "grey70") +
+  geom_boxplot( fill = NA, outlier.shape = NA) +
+  facet_wrap( ~ clust_traj23) +
+  theme_classic(12) +
+  stat_compare_means( size = 2.1) +
+  labs( y = "NPX [AU]", x = "sampling phase", title = "LAP3") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 8))
+
+```
+
+```{r}
+df <- read.csv("sampling and vaccination dates_fig1b.csv")
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+df_summarized <- df |> 
+  # 1. Convert character strings to Date class
+  mutate(across(c(sampling_time, date1, date2, date3), ymd)) |> 
+  
+  # 2. Invalidate doses that occurred AFTER sampling_time
+  mutate(
+    date1 = if_else(date1 <= sampling_time, date1, NA_Date_),
+    date2 = if_else(date2 <= sampling_time, date2, NA_Date_),
+    date3 = if_else(date3 <= sampling_time, date3, NA_Date_)
+  ) |> 
+  
+  # 3. Pivot dose dates to long format to extract month/year
+  pivot_longer(
+    cols = c(date1, date2, date3),
+    names_to = "dose",
+    values_to = "vax_date"
+  ) |> 
+  
+  # 4. Keep valid vaccination dates and truncate to Year-Month (YYYY-MM-01)
+  filter(!is.na(vax_date)) |> 
+  mutate(date = floor_date(vax_date, unit = "month")) |> 
+  
+  # 5. Count samples per month per dose level
+  count(date, dose) |> 
+  
+  # 6. Pivot back wide so each dose has its own column
+  pivot_wider(
+    names_from = dose,
+    values_from = n,
+    values_fill = 0
+  ) |> 
+  
+  # 7. Rename columns and ensure date display format (YYYY-MM)
+  rename(
+    vaccine_dose_1 = date1,
+    vaccine_dose_2 = date2,
+    vaccine_dose_3 = date3
+  ) |> 
+  mutate(date = format(date, "%Y-%m")) |> 
+  arrange(date)
+```
