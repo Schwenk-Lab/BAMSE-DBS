@@ -3,13 +3,19 @@
 ### Molecular profiling of repeated self-sampled blood reveals dynamic immune phenotypes in young adults
 <hr>
 
-Annika Bendes<sup>#+</sup>, Sophia Björkander<sup>#+</sup>‚ Maura M. Kere<sup>+</sup>, Simon Kebede Merid<sup>+</sup>, Ashish Kumar<sup>+</sup>, Leo Dahl<sup>+</sup>, Tess D. Pottinger, Zhebin Yu, Anna Gardell, Amelie Vogt, Changil Kim, Qiang Pan-Hammarström, Anna Bergström, Inger Kull, Anne-Sophie Merritt, Sandra Ekström, Alexandra Lövquist, Ben Murrell<sup>+</sup>, Niclas Roxhed, Erik Melén<sup>$</sup>\*, and Jochen M. Schwenk<sup>$</sup>\*
+Annika Bendes<sup>#+</sup>, Sophia Björkander<sup>#+</sup>‚ Maura M. Kere<sup>+</sup>, Simon Kebede Merid<sup>+</sup>, Ashish Kumar, Leo Dahl<sup>+</sup>, Tess D. Pottinger, Zhebin Yu, Anna Gardell, Amelie Vogt, Changil Kim, Qiang Pan-Hammarström, Anna Bergström, Inger Kull, Anne-Sophie Merritt, Sandra Ekström, Alexandra Lövquist, Ben Murrell<sup>+</sup>, Niclas Roxhed, Erik Melén<sup>$</sup>\*, and Jochen M. Schwenk<sup>$</sup>\*
 
 
 This repository contains code for analysis and visualisation to accompany the publication  
 _Molecular profiling of repeated self-sampled blood reveals dynamic immune phenotypes in young adults_.
 
 <br><br>
+
+<code>BAMSE DBS main analysis file.qmd</code>  
+Main analysis and figures.
+
+<code>Bendes_et_al_STATAcode_Tab1Tab2Tab3Tab4Fig3SuppData3SuppData4.do</code>  
+STATA code for additional tables and figures.
 
 <code>aab inf cutoff generation.qmd</code>, <code>bamse_ben_norm_IgM.Rmd</code>, <code>ben_mixmod.jl</code>, <code>julia_env.yml</code>  
 Perform mixed model normalisation of serology data, with a Conda environment for Julia.
@@ -26,6 +32,9 @@ Visualise IFN AAb correlations.
 <code>comp_groups.R</code>  
 Perform group comparisons with statistical testing.
 
+<br>
+
+Code for the pQTL analysis can be found in [this repository](https://github.com/kumar-ashish/BAMSE-pQTL-analysis).
 
 <hr>
 
